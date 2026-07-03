@@ -23,11 +23,11 @@ privileged input, or advantage-aware weighting.
 
 ## Data
 
-The parquet rows are loaded by verl's default `RLHFDataset`; there is no custom
-dataset adapter or offline preprocessing step. The scripts set
-`data.prompt_key=problem` and `data.image_key=image`, so `problem` should already
-be chat messages in the standard verl format and image placeholders should be
-handled by the default dataset path.
+The raw parquet rows are `image/problem/answer`. There is no offline
+preprocessing step. The training scripts use `data.custom_cls` to load
+`raw_image_qa_dataset.py`, a thin runtime adapter on top of verl's existing
+`RLHFDataset`. It wraps the `problem` string into a user chat message, injects
+the original `image` payload, and maps `answer` to `reward_model.ground_truth`.
 
 `TRAIN_FILES` defaults to the six local shards under
 `dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/`. You can still override it with a
@@ -40,6 +40,19 @@ bash verl/examples/on_policy_distillation_trainer/run_qwen3vl_8b_to_2b_fsdp.sh
 
 `VAL_FILES` defaults to `TRAIN_FILES`, and validation is disabled by default
 (`trainer.val_before_train=False`, `trainer.test_freq=-1`).
+
+The default prompt template is:
+
+```text
+<image>
+{problem}
+
+{instruction}
+```
+
+`PROMPT_TEMPLATE` and `PROMPT_INSTRUCTION` are passed through environment
+variables instead of Hydra overrides, so tags such as `<think>`, `<answer>`, and
+`<image>` are safe.
 
 ## Run One Baseline
 
@@ -60,6 +73,16 @@ TRAIN_FILES="['/path/train-00000-of-00006.parquet', '/path/train-00001-of-00006.
 LOGGER='["console"]' \
 DISTILLATION_LOSS_MODE=k1 \
 USE_POLICY_GRADIENT=True \
+bash verl/examples/on_policy_distillation_trainer/run_qwen3vl_8b_to_2b_fsdp.sh
+```
+
+To change the shared distillation prompt template:
+
+```bash
+PROMPT_TEMPLATE='<image>
+{problem}
+
+{instruction}' \
 bash verl/examples/on_policy_distillation_trainer/run_qwen3vl_8b_to_2b_fsdp.sh
 ```
 

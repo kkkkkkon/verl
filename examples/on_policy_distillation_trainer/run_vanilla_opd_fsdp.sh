@@ -26,6 +26,14 @@ TRAIN_FILE=${TRAIN_FILE:-}
 VAL_FILE=${VAL_FILE:-}
 TRAIN_FILES=${TRAIN_FILES:-"['dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00000-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00001-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00002-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00003-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00004-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00005-of-00006.parquet']"}
 VAL_FILES=${VAL_FILES:-}
+DATA_SOURCE=${DATA_SOURCE:-PAPOGalaxy/PAPO_ViRL39K_train}
+PROMPT_INSTRUCTION=${PROMPT_INSTRUCTION:-"You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE enclosed within <answer> </answer> tags."}
+PROMPT_TEMPLATE=${PROMPT_TEMPLATE:-"<image>
+{problem}
+
+{instruction}"}
+export RAW_IMAGE_QA_PROMPT_INSTRUCTION="$PROMPT_INSTRUCTION"
+export RAW_IMAGE_QA_PROMPT_TEMPLATE="$PROMPT_TEMPLATE"
 
 build_file_list() {
     local result="["
@@ -132,6 +140,10 @@ DATA=(
     data.val_files="$VAL_FILES"
     data.prompt_key=problem
     data.image_key=image
+    +data.answer_key=answer
+    +data.default_data_source="$DATA_SOURCE"
+    data.custom_cls.path="$SCRIPT_DIR/raw_image_qa_dataset.py"
+    data.custom_cls.name=RawImageQADataset
     data.train_batch_size=${train_batch_size}
     data.val_batch_size=${train_batch_size}
     data.val_max_samples=${val_max_samples}
