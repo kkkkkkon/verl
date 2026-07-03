@@ -22,14 +22,30 @@ RUN_NAME=${RUN_NAME:-qwen3vl_8b_to_2b}
 
 # ---- data ----
 DATA_DIR=${DATA_DIR:-$HOME/data/image_qa}
-TRAIN_FILE=${TRAIN_FILE:-$DATA_DIR/train.parquet}
-VAL_FILE=${VAL_FILE:-$TRAIN_FILE}
+TRAIN_FILE=${TRAIN_FILE:-}
+VAL_FILE=${VAL_FILE:-}
+TRAIN_FILES=${TRAIN_FILES:-}
+VAL_FILES=${VAL_FILES:-}
 DATA_SOURCE=${DATA_SOURCE:-PAPOGalaxy/PAPO_ViRL39K_train}
 PROMPT_INSTRUCTION=${PROMPT_INSTRUCTION:-"You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE enclosed within <answer> </answer> tags."}
 PROMPT_TEMPLATE=${PROMPT_TEMPLATE:-"<image>
 {problem}
 
 {instruction}"}
+
+build_file_list() {
+    local result="["
+    local separator=""
+    local file
+
+    for file in "$@"; do
+        result="${result}${separator}'${file}'"
+        separator=", "
+    done
+
+    result="${result}]"
+    printf '%s\n' "$result"
+}
 
 # ---- resources ----
 NNODES=${NNODES:-1}
@@ -69,22 +85,57 @@ experiment_name=${EXPERIMENT_NAME:-${RUN_NAME}_${distillation_loss_mode}_vanilla
 
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 
-if [[ ! -f "$TRAIN_FILE" ]]; then
-    echo "Missing TRAIN_FILE=$TRAIN_FILE" >&2
-    echo "Set TRAIN_FILE to the raw parquet file containing image/problem/answer columns." >&2
-    exit 1
+train_file_paths=()
+if [[ -z "$TRAIN_FILES" ]]; then
+    if [[ -n "$TRAIN_FILE" ]]; then
+        train_file_paths=("$TRAIN_FILE")
+    else
+        train_shards=("$DATA_DIR"/train-*.parquet)
+        if [[ -f "${train_shards[0]}" ]]; then
+            train_file_paths=("${train_shards[@]}")
+        else
+            train_file_paths=("$DATA_DIR/train.parquet")
+        fi
+    fi
+
+    TRAIN_FILES=$(build_file_list "${train_file_paths[@]}")
 fi
 
-if [[ ! -f "$VAL_FILE" ]]; then
-    echo "VAL_FILE=$VAL_FILE not found; using TRAIN_FILE as validation placeholder." >&2
-    VAL_FILE="$TRAIN_FILE"
+if [[ ${#train_file_paths[@]} -gt 0 ]]; then
+    for file in "${train_file_paths[@]}"; do
+        if [[ ! -f "$file" ]]; then
+            echo "Missing training file: $file" >&2
+            echo "Set DATA_DIR to the shard directory, TRAIN_FILE to one parquet, or TRAIN_FILES to a Hydra list." >&2
+            exit 1
+        fi
+    done
+fi
+
+val_file_paths=()
+if [[ -z "$VAL_FILES" ]]; then
+    if [[ -n "$VAL_FILE" ]]; then
+        val_file_paths=("$VAL_FILE")
+        VAL_FILES=$(build_file_list "${val_file_paths[@]}")
+    else
+        VAL_FILES="$TRAIN_FILES"
+    fi
+fi
+
+if [[ ${#val_file_paths[@]} -gt 0 ]]; then
+    for file in "${val_file_paths[@]}"; do
+        if [[ ! -f "$file" ]]; then
+            echo "VAL_FILE=$file not found; using training files as validation placeholder." >&2
+            VAL_FILES="$TRAIN_FILES"
+            break
+        fi
+    done
 fi
 
 DATA=(
     algorithm.adv_estimator=grpo
     algorithm.use_kl_in_reward=False
-    data.train_files="['$TRAIN_FILE']"
-    data.val_files="['$VAL_FILE']"
+    data.train_files="$TRAIN_FILES"
+    data.val_files="$VAL_FILES"
     data.prompt_key=problem
     data.image_key=image
     +data.answer_key=answer

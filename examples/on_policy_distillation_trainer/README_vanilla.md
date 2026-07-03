@@ -28,14 +28,20 @@ preprocessing step. The training scripts use `data.custom_cls` to load
 `raw_image_qa_dataset.py`, a thin runtime adapter on top of verl's existing
 `RLHFDataset`.
 
-Set `TRAIN_FILE` to the raw parquet file:
+Set `DATA_DIR` to a directory containing `train-*.parquet` shards, or set
+`TRAIN_FILES` directly to a Hydra list:
 
 ```bash
-TRAIN_FILE=/path/to/train.parquet \
+DATA_DIR=/path/to/dataset_dir \
 bash verl/examples/on_policy_distillation_trainer/run_qwen3vl_8b_to_2b_fsdp.sh
 ```
 
-`VAL_FILE` defaults to `TRAIN_FILE`, and validation is disabled by default
+```bash
+TRAIN_FILES="['/path/train-00000-of-00006.parquet', '/path/train-00001-of-00006.parquet']" \
+bash verl/examples/on_policy_distillation_trainer/run_qwen3vl_8b_to_2b_fsdp.sh
+```
+
+`VAL_FILES` defaults to `TRAIN_FILES`, and validation is disabled by default
 (`trainer.val_before_train=False`, `trainer.test_freq=-1`).
 
 The default prompt template is:
@@ -66,7 +72,7 @@ bash verl/examples/on_policy_distillation_trainer/run_all_vanilla_opd_fsdp.sh
 Useful overrides:
 
 ```bash
-TRAIN_FILE=/path/to/train.parquet \
+DATA_DIR=/path/to/dataset_dir \
 LOGGER='["console"]' \
 DISTILLATION_LOSS_MODE=k1 \
 USE_POLICY_GRADIENT=True \
