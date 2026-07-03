@@ -40,6 +40,8 @@ DEFAULT_INSTRUCTION = (
     "The final answer MUST BE enclosed within <answer> </answer> tags."
 )
 DEFAULT_PROMPT_TEMPLATE = "<image>\n{problem}\n\n{instruction}"
+PROMPT_INSTRUCTION_ENV = "RAW_IMAGE_QA_PROMPT_INSTRUCTION"
+PROMPT_TEMPLATE_ENV = "RAW_IMAGE_QA_PROMPT_TEMPLATE"
 
 
 class RawImageQADataset(RLHFDataset):
@@ -54,13 +56,17 @@ class RawImageQADataset(RLHFDataset):
         self.default_data_source = (
             config.get("default_data_source", DEFAULT_DATA_SOURCE) if config is not None else DEFAULT_DATA_SOURCE
         )
+        env_instruction = os.environ.get(PROMPT_INSTRUCTION_ENV)
+        env_template = os.environ.get(PROMPT_TEMPLATE_ENV)
         self.prompt_instruction = (
-            config.get("prompt_instruction", DEFAULT_INSTRUCTION) if config is not None else DEFAULT_INSTRUCTION
+            config.get("prompt_instruction", env_instruction or DEFAULT_INSTRUCTION)
+            if config is not None
+            else env_instruction or DEFAULT_INSTRUCTION
         )
         self.prompt_template = (
-            config.get("prompt_template", DEFAULT_PROMPT_TEMPLATE)
+            config.get("prompt_template", env_template or DEFAULT_PROMPT_TEMPLATE)
             if config is not None
-            else DEFAULT_PROMPT_TEMPLATE
+            else env_template or DEFAULT_PROMPT_TEMPLATE
         )
         super().__init__(*args, **kwargs)
 

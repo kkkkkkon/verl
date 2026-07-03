@@ -32,6 +32,8 @@ PROMPT_TEMPLATE=${PROMPT_TEMPLATE:-"<image>
 {problem}
 
 {instruction}"}
+export RAW_IMAGE_QA_PROMPT_INSTRUCTION="$PROMPT_INSTRUCTION"
+export RAW_IMAGE_QA_PROMPT_TEMPLATE="$PROMPT_TEMPLATE"
 
 build_file_list() {
     local result="["
@@ -140,8 +142,6 @@ DATA=(
     data.image_key=image
     +data.answer_key=answer
     +data.default_data_source="$DATA_SOURCE"
-    +data.prompt_instruction="$PROMPT_INSTRUCTION"
-    +data.prompt_template="$PROMPT_TEMPLATE"
     data.custom_cls.path="$SCRIPT_DIR/raw_image_qa_dataset.py"
     data.custom_cls.name=RawImageQADataset
     data.train_batch_size=${train_batch_size}

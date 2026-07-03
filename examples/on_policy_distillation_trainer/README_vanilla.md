@@ -57,6 +57,10 @@ The student rollout and teacher-logprob pass then share the same tokenized
 `raw_prompt` and the same image payload through verl's native distillation path,
 so the distillation template stays consistent.
 
+`PROMPT_TEMPLATE` and `PROMPT_INSTRUCTION` are passed through environment
+variables instead of Hydra overrides, so tags such as `<think>`, `<answer>`, and
+`<image>` are safe.
+
 ## Run One Baseline
 
 ```bash
