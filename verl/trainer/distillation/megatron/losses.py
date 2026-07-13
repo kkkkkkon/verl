@@ -294,6 +294,8 @@ def compute_forward_kl_topk(
 
     # 2. compute token-wise KL divergence across tp groups
     distillation_loss_config: DistillationLossConfig = config.distillation_loss
+    if getattr(distillation_loss_config, "loss_mode", "forward_kl_topk") == "reverse_kl":
+        raise NotImplementedError("reverse_kl top-k distillation is currently implemented for FSDP/VeOmni only.")
     distillation_losses, student_mass, teacher_mass, overlap_count, overlap_token_advantage = (
         _VocabParallelKLDivergence.apply(
             student_logits,

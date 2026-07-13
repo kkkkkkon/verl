@@ -26,6 +26,9 @@ distillation_loss:
   # If distillation loss requires top-k logits, this is the value of k
   topk: 32
 
+  # Support construction mode for top-k distillation losses: prob or prob_perception
+  topk_mode: prob
+
   # Whether to include task rewards alongside distillation loss.
   use_task_rewards: true
 

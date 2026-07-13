@@ -43,6 +43,10 @@ from tensordict import TensorDict
 
 from verl.trainer.distillation.fsdp.losses import compute_forward_kl_topk as compute_fsdp_forward_kl_topk
 from verl.trainer.distillation.losses import compute_forward_kl_topk as collect_forward_kl_topk_metrics
+from verl.trainer.distillation.topk_support import (
+    build_topk_support_ids,
+    gather_teacher_logprobs_from_support,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
@@ -246,3 +250,44 @@ def test_forward_kl_topk_metric_aggregation_for_overlap_outputs():
 
     assert metrics["distillation/overlap_ratio"] == pytest.approx(0.75)
     assert metrics["distillation/overlap_token_advantage"] == pytest.approx(-0.3)
+
+
+def test_prob_perception_support_and_reverse_kl_on_cpu():
+    torch.manual_seed(0)
+    bsz, seqlen, vocab_size, topk = 2, 3, 64, 32
+    student_logits = torch.randn(bsz, seqlen, vocab_size)
+    teacher_logits_img = torch.randn(bsz, seqlen, vocab_size)
+    teacher_logits_mask = torch.randn(bsz, seqlen, vocab_size)
+
+    support_ids = build_topk_support_ids(
+        teacher_logits_img,
+        teacher_logits_mask=teacher_logits_mask,
+        topk=topk,
+        topk_mode="prob_perception",
+    )
+
+    assert support_ids.shape == (bsz, seqlen, topk)
+    perception_score = teacher_logits_img - teacher_logits_mask
+    expected_perception_ids = torch.topk(perception_score, k=topk // 2, dim=-1).indices
+    torch.testing.assert_close(support_ids[..., topk // 2 :], expected_perception_ids)
+
+    teacher_logprobs = gather_teacher_logprobs_from_support(teacher_logits_img, support_ids)
+    support_ids_nested = _nested_from_rows(support_ids.reshape(-1, topk).tolist()).to(torch.int64)
+    teacher_logprobs_nested = _nested_from_rows(teacher_logprobs.reshape(-1, topk).tolist()).to(torch.float32)
+    config = SimpleNamespace(
+        distillation_loss=SimpleNamespace(
+            log_prob_min_clamp=None,
+            loss_mode="reverse_kl",
+            use_chunked_topk=False,
+        )
+    )
+
+    output = compute_fsdp_forward_kl_topk(
+        student_logits=student_logits.reshape(1, bsz * seqlen, vocab_size),
+        teacher_topk_log_probs=teacher_logprobs_nested,
+        teacher_topk_ids=support_ids_nested,
+        config=config,
+        data_format="thd",
+    )
+
+    assert torch.isfinite(output["distillation_losses"]).all()

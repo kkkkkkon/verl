@@ -13,13 +13,19 @@
 # limitations under the License.
 import logging
 import os
+from io import BytesIO
 from typing import Any, Optional
 from uuid import uuid4
 
 import torch
 from omegaconf import DictConfig
+from PIL import Image
 from torch.nn import functional as F
 
+from verl.trainer.distillation.topk_support import (
+    TOPK_MODE_PROB_PERCEPTION,
+    build_prob_perception_support_from_topk_outputs,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import (
     DistillationConfig,
@@ -54,6 +60,50 @@ def _get_teacher_sampling_params(
         "temperature": 1.0,
         "prompt_logprobs": num_logprobs,
     }
+
+
+def _mask_image_payload(image: Any) -> Any:
+    if isinstance(image, Image.Image):
+        return Image.new(image.mode, image.size)
+    if isinstance(image, bytes):
+        source = Image.open(BytesIO(image))
+        return Image.new(source.mode, source.size)
+    if isinstance(image, str | os.PathLike):
+        source = Image.open(os.fspath(image))
+        return Image.new(source.mode, source.size)
+    if torch.is_tensor(image):
+        return torch.zeros_like(image)
+    if isinstance(image, dict):
+        payload = dict(image)
+        if payload.get("image") is not None:
+            payload["image"] = _mask_image_payload(payload["image"])
+        elif payload.get("bytes") is not None:
+            payload["image"] = _mask_image_payload(payload["bytes"])
+            payload.pop("bytes", None)
+        elif payload.get("path") is not None:
+            payload["image"] = _mask_image_payload(payload["path"])
+            payload.pop("path", None)
+        return payload
+    try:
+        import numpy as np
+
+        if isinstance(image, np.ndarray):
+            return np.zeros_like(image)
+    except ImportError:
+        pass
+    raise TypeError(f"Unsupported image payload for prob_perception masking: {type(image)}")
+
+
+def _mask_multi_modal_images(multi_modal_data: dict[str, Any]) -> dict[str, Any]:
+    masked_data = dict(multi_modal_data)
+    images = masked_data.get("images")
+    if images is None:
+        return masked_data
+    if isinstance(images, list):
+        masked_data["images"] = [_mask_image_payload(image) for image in images]
+    else:
+        masked_data["images"] = _mask_image_payload(images)
+    return masked_data
 
 
 def _pad_teacher_outputs(
@@ -112,18 +162,14 @@ class AsyncTeacherLLMServerManager:
             )
         return routing_key
 
-    async def compute_teacher_logprobs_single(
+    async def _generate_teacher_logprobs(
         self,
+        client: LLMServerClient,
+        teacher_model_config: DistillationTeacherModelConfig,
         sequence_ids: list[int],
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
-        routing_key: Optional[str] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute teacher log probabilities for a single unpadded sequence."""
-        multi_modal_data = multi_modal_data or {}
-        teacher_key = self._resolve_teacher_key(routing_key)
-        teacher_model_config = self.teacher_model_configs[teacher_key]
-        client = self.teacher_client[teacher_key]
         teacher_output = await client.generate(
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,
@@ -138,4 +184,45 @@ class AsyncTeacherLLMServerManager:
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
+        return teacher_ids, teacher_logprobs
+
+    async def compute_teacher_logprobs_single(
+        self,
+        sequence_ids: list[int],
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        routing_key: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute teacher log probabilities for a single unpadded sequence."""
+        multi_modal_data = multi_modal_data or {}
+        teacher_key = self._resolve_teacher_key(routing_key)
+        teacher_model_config = self.teacher_model_configs[teacher_key]
+        client = self.teacher_client[teacher_key]
+        teacher_ids, teacher_logprobs = await self._generate_teacher_logprobs(
+            client=client,
+            teacher_model_config=teacher_model_config,
+            sequence_ids=sequence_ids,
+            multi_modal_data=multi_modal_data,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+
+        if (
+            self.distillation_loss_config.loss_settings.use_topk
+            and self.distillation_loss_config.topk_mode == TOPK_MODE_PROB_PERCEPTION
+        ):
+            masked_multi_modal_data = _mask_multi_modal_images(multi_modal_data)
+            teacher_ids_mask, teacher_logprobs_mask = await self._generate_teacher_logprobs(
+                client=client,
+                teacher_model_config=teacher_model_config,
+                sequence_ids=sequence_ids,
+                multi_modal_data=masked_multi_modal_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+            teacher_ids, teacher_logprobs = build_prob_perception_support_from_topk_outputs(
+                teacher_ids,
+                teacher_logprobs,
+                teacher_ids_mask,
+                teacher_logprobs_mask,
+                topk=self.distillation_loss_config.topk,
+            )
         return teacher_ids, teacher_logprobs

@@ -25,8 +25,13 @@ DATA_DIR=${DATA_DIR:-$HOME/data/image_qa}
 TRAIN_FILE=${TRAIN_FILE:-}
 VAL_FILE=${VAL_FILE:-}
 TRAIN_FILES=${TRAIN_FILES:-"['dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00000-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00001-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00002-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00003-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00004-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00005-of-00006.parquet']"}
-VAL_FILES=${VAL_FILES:-}
+VAL_FILES=${VAL_FILES:-"['/data/chutong/workspace/rl-reason/verl/dataset/hiyouga/data/validation-00000-of-00001.parquet']"}
+
 DATA_SOURCE=${DATA_SOURCE:-PAPOGalaxy/PAPO_ViRL39K_train}
+VAL_DATA_SOURCE=${VAL_DATA_SOURCE:-hiyouga/validation}
+IMAGE_KEY=${IMAGE_KEY:-images}
+IMAGE_MIN_PIXELS=${IMAGE_MIN_PIXELS:-200704}
+IMAGE_MAX_PIXELS=${IMAGE_MAX_PIXELS:-1003520}
 PROMPT_INSTRUCTION=${PROMPT_INSTRUCTION:-"You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE enclosed within <answer> </answer> tags."}
 PROMPT_TEMPLATE=${PROMPT_TEMPLATE:-"<image>
 {problem}
@@ -51,37 +56,38 @@ build_file_list() {
 
 # ---- resources ----
 NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-1}
 TEACHER_NNODES=${TEACHER_NNODES:-1}
-TEACHER_TP=${TEACHER_TP:-4}
+TEACHER_TP=${TEACHER_TP:-1}
 TEACHER_NUM_REPLICAS=${TEACHER_NUM_REPLICAS:-1}
 TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE:-$(( TEACHER_TP * TEACHER_NUM_REPLICAS ))}
 
 # ---- paper-style hyperparameters ----
-train_batch_size=${TRAIN_BATCH_SIZE:-64}
-ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-64}
+train_batch_size=${TRAIN_BATCH_SIZE:-128}
+ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-128}
 val_max_samples=${VAL_MAX_SAMPLES:-512}
 rollout_n=${ROLLOUT_N:-4}
-total_training_steps=${TOTAL_TRAINING_STEPS:-300}
-total_epochs=${TOTAL_EPOCHS:-30}
-actor_lr=${ACTOR_LR:-5e-6}
+# total_training_steps=${TOTAL_TRAINING_STEPS:-300}
+total_epochs=${TOTAL_EPOCHS:-2}
+actor_lr=${ACTOR_LR:-1e-6}
 lr_warmup_steps_ratio=${LR_WARMUP_STEPS_RATIO:-0.0}
 
-max_prompt_length=${MAX_PROMPT_LENGTH:-1024}
-max_response_length=${MAX_RESPONSE_LENGTH:-2048}
+max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
+max_response_length=${MAX_RESPONSE_LENGTH:-4096}
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
 
-distillation_loss_mode=${DISTILLATION_LOSS_MODE:-k1}
-use_policy_gradient=${USE_POLICY_GRADIENT:-True}
-distillation_topk=${DISTILLATION_TOPK:-128}
+distillation_loss_mode=${DISTILLATION_LOSS_MODE:-forward_kl_topk}
+use_policy_gradient=${USE_POLICY_GRADIENT:-False}
+distillation_topk=${DISTILLATION_TOPK:-32}
 
-rollout_tp=${ROLLOUT_TP:-2}
-rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.4}
-teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.4}
+rollout_tp=${ROLLOUT_TP:-1}
+rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.8}
+teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.8}
 
 save_freq=${SAVE_FREQ:-100}
-test_freq=${TEST_FREQ:--1}
-logger=${LOGGER:-'["console","wandb"]'}
+test_freq=${TEST_FREQ:-25}
+val_before_train=${VAL_BEFORE_TRAIN:-False}
+logger=${LOGGER:-'["console","swanlab"]'}
 project_name=${PROJECT_NAME:-vanilla_opd}
 experiment_name=${EXPERIMENT_NAME:-${RUN_NAME}_${distillation_loss_mode}_vanilla}
 
@@ -139,9 +145,14 @@ DATA=(
     data.train_files="$TRAIN_FILES"
     data.val_files="$VAL_FILES"
     data.prompt_key=problem
-    data.image_key=image
+    data.image_key=${IMAGE_KEY}
     +data.answer_key=answer
     +data.default_data_source="$DATA_SOURCE"
+    +data.val_default_data_source="$VAL_DATA_SOURCE"
+    +data.image_min_pixels=${IMAGE_MIN_PIXELS}
+    +data.image_max_pixels=${IMAGE_MAX_PIXELS}
+    +data.mm_processor_kwargs.min_pixels=${IMAGE_MIN_PIXELS}
+    +data.mm_processor_kwargs.max_pixels=${IMAGE_MAX_PIXELS}
     data.custom_cls.path="$SCRIPT_DIR/raw_image_qa_dataset.py"
     data.custom_cls.name=RawImageQADataset
     data.train_batch_size=${train_batch_size}
@@ -164,7 +175,7 @@ MODEL=(
 ACTOR=(
     actor_rollout_ref.actor.use_torch_compile=True
     actor_rollout_ref.actor.optim.lr=${actor_lr}
-    actor_rollout_ref.actor.optim.lr_scheduler_type=cosine
+    actor_rollout_ref.actor.optim.lr_scheduler_type=constant
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=${lr_warmup_steps_ratio}
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
     actor_rollout_ref.actor.use_dynamic_bsz=True
@@ -190,11 +201,11 @@ TRAINER=(
     trainer.experiment_name=${experiment_name}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}
     trainer.nnodes=${NNODES}
-    trainer.val_before_train=False
+    trainer.val_before_train=${val_before_train}
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}
-    trainer.total_training_steps=${total_training_steps}
+    # trainer.total_training_steps=${total_training_steps}
 )
 
 REWARD=(

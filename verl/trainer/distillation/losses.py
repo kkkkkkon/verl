@@ -296,14 +296,16 @@ def distillation_loss(
     return distillation_loss, distillation_metrics
 
 
-@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
+@register_distillation_loss(
+    DistillationLossSettings(names=["forward_kl_topk", "reverse_kl"], use_topk=True)
+)  # type: ignore[arg-type]
 def compute_forward_kl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,
     model_output: dict,
     data: TensorDict,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Compute forward KL distillation loss and related metrics using top-k log probabilities.
+    """Compute top-k distillation loss and related metrics using top-k log probabilities.
 
     Returns:
     - distillation_losses: (bsz, resp_len)

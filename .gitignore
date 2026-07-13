@@ -131,3 +131,7 @@ logs
 log
 outputs
 .history
+wandb
+swanlab
+*.jsonl
+*.json

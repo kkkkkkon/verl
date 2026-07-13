@@ -36,6 +36,11 @@ class DistillationLossConfig(BaseConfig):
         Distillation loss function to use.
     topk (int, optional):
         Number of top tokens to consider for top-k distillation losses.
+    topk_mode (str):
+        Support construction mode for top-k distillation losses. ``prob`` keeps
+        the teacher probability top-k behavior. ``prob_perception`` combines
+        probability top-k ids with ids selected by full-image minus masked-image
+        teacher logits.
     use_task_rewards (bool):
         Whether to include task rewards alongside distillation loss.
     distillation_loss_coef (float):
@@ -64,6 +69,7 @@ class DistillationLossConfig(BaseConfig):
 
     loss_mode: str = "k3"
     topk: Optional[int] = 128
+    topk_mode: str = "prob"
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
     loss_max_clamp: Optional[float] = 10.0
@@ -100,8 +106,21 @@ class DistillationLossConfig(BaseConfig):
     def __post_init__(self):
         self._mutable_fields.add("loss_settings")
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
+        from verl.trainer.distillation.topk_support import (
+            TOPK_MODE_PROB,
+            TOPK_MODE_PROB_PERCEPTION,
+            split_prob_perception_topk,
+            validate_topk_mode,
+        )
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+        validate_topk_mode(self.topk_mode)
+        if self.topk_mode != TOPK_MODE_PROB and not self.loss_settings.use_topk:
+            raise ValueError(f"distillation topk_mode={self.topk_mode!r} requires a top-k distillation loss.")
+        if self.topk_mode == TOPK_MODE_PROB_PERCEPTION:
+            if self.topk is None:
+                raise ValueError("topk must be specified when topk_mode='prob_perception'.")
+            split_prob_perception_topk(self.topk)
 
         if self.policy_loss_mode != "vanilla":
             raise NotImplementedError(
@@ -109,9 +128,9 @@ class DistillationLossConfig(BaseConfig):
                 f"but got {self.policy_loss_mode}."
             )
 
-        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
+        if self.use_policy_gradient and self.loss_settings.use_topk:
             print(
-                "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
+                "WARNING: top-k distillation losses are most effective as supervised distillation losses "
                 "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
                 " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
                 "should move) is largely unused."

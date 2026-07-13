@@ -72,6 +72,15 @@ def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
     return kld.sum(dim=-1)
 
 
+def reverse_kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
+    """Compute KL(Q || P) on the provided support from log probabilities."""
+    log_p = log_p.float()
+    log_q = log_q.float()
+    q = log_q.exp()
+    kld = q * (log_q - log_p)
+    return kld.sum(dim=-1)
+
+
 def compute_forward_kl_topk(
     student_logits: torch.Tensor,
     teacher_topk_log_probs: torch.Tensor,
@@ -127,13 +136,18 @@ def compute_forward_kl_topk(
     if loss_config.log_prob_min_clamp is not None:
         student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
         teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
-    distillation_losses = kl_divergence(log_q=student_topk_log_probs, log_p=teacher_topk_log_probs)
+    loss_mode = getattr(loss_config, "loss_mode", "forward_kl_topk")
+    if loss_mode == "reverse_kl":
+        distillation_losses = reverse_kl_divergence(log_q=student_topk_log_probs, log_p=teacher_topk_log_probs)
+        token_kl = student_topk_log_probs.exp() * (student_topk_log_probs - teacher_topk_log_probs)
+    else:
+        distillation_losses = kl_divergence(log_q=student_topk_log_probs, log_p=teacher_topk_log_probs)
+        token_kl = teacher_topk_log_probs.exp() * (teacher_topk_log_probs - student_topk_log_probs)
 
     # Diagnostics for tracking teacher/student top-k overlap in OPD, following
     # "Rethinking On-Policy Distillation of Large Language Models" (arXiv:2604.13016).
     overlap_mask = (teacher_topk_ids.unsqueeze(-1) == student_topk_ids.unsqueeze(-2)).any(dim=-1)
     overlap_count = overlap_mask.sum(dim=-1)
-    token_kl = teacher_topk_log_probs.exp() * (teacher_topk_log_probs - student_topk_log_probs)
     overlap_token_advantage_sum = (-token_kl * overlap_mask).sum(dim=-1)
     overlap_token_advantage = overlap_token_advantage_sum / overlap_count.clamp_min(1)
     overlap_token_advantage = torch.where(

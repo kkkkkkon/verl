@@ -47,11 +47,28 @@ class RawImageQADataset(RLHFDataset):
         config = kwargs.get("config")
         if config is None and len(args) >= 3:
             config = args[2]
+        data_files = kwargs.get("data_files")
+        if data_files is None and args:
+            data_files = args[0]
 
         self.answer_key = config.get("answer_key", "answer") if config is not None else "answer"
-        self.default_data_source = (
-            config.get("default_data_source", DEFAULT_DATA_SOURCE) if config is not None else DEFAULT_DATA_SOURCE
+        self.default_data_source = self._resolve_default_data_source(config, data_files)
+        self.image_min_pixels = (
+            int(config.get("image_min_pixels"))
+            if config is not None and config.get("image_min_pixels") is not None
+            else None
         )
+        self.image_max_pixels = (
+            int(config.get("image_max_pixels"))
+            if config is not None and config.get("image_max_pixels") is not None
+            else None
+        )
+        if (
+            self.image_min_pixels is not None
+            and self.image_max_pixels is not None
+            and self.image_min_pixels > self.image_max_pixels
+        ):
+            raise ValueError("image_min_pixels cannot be larger than image_max_pixels.")
 
         env_instruction = os.environ.get(PROMPT_INSTRUCTION_ENV)
         env_template = os.environ.get(PROMPT_TEMPLATE_ENV)
@@ -67,6 +84,25 @@ class RawImageQADataset(RLHFDataset):
         )
 
         super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _normalize_file_list(files: Any) -> list[str]:
+        if files is None:
+            return []
+        if isinstance(files, str | os.PathLike):
+            return [os.fspath(files)]
+        return [os.fspath(file) for file in files]
+
+    @classmethod
+    def _resolve_default_data_source(cls, config, data_files: Any) -> str:
+        if config is None:
+            return DEFAULT_DATA_SOURCE
+
+        default_data_source = config.get("default_data_source", DEFAULT_DATA_SOURCE)
+        val_default_data_source = config.get("val_default_data_source", default_data_source)
+        if sorted(cls._normalize_file_list(data_files)) == sorted(cls._normalize_file_list(config.get("val_files"))):
+            return val_default_data_source
+        return default_data_source
 
     @staticmethod
     def _as_image_list(image_payload: Any) -> list[Any]:
@@ -94,6 +130,14 @@ class RawImageQADataset(RLHFDataset):
             return {"type": "image", "image": os.fspath(image_payload)}
         raise TypeError(f"Unsupported image type: {type(image_payload)}")
 
+    def _to_limited_image_content(self, image_payload: Any) -> dict[str, Any]:
+        content = self._to_image_content(image_payload)
+        if self.image_min_pixels is not None:
+            content.setdefault("min_pixels", self.image_min_pixels)
+        if self.image_max_pixels is not None:
+            content.setdefault("max_pixels", self.image_max_pixels)
+        return content
+
     def _render_prompt(self, problem: Any) -> str:
         problem = str(problem).replace("<image>", "").strip()
         return self.prompt_template.format(problem=problem, instruction=self.prompt_instruction).strip()
@@ -109,16 +153,16 @@ class RawImageQADataset(RLHFDataset):
                 continue
             if segment == "<image>":
                 if image_offset < len(images):
-                    content.append(self._to_image_content(images[image_offset]))
+                    content.append(self._to_limited_image_content(images[image_offset]))
                     image_offset += 1
                 continue
             content.append({"type": "text", "text": segment})
 
         if image_offset == 0 and images:
-            content = [self._to_image_content(images[0]), *content]
+            content = [self._to_limited_image_content(images[0]), *content]
             image_offset = 1
         for image in images[image_offset:]:
-            content.insert(0, self._to_image_content(image))
+            content.insert(0, self._to_limited_image_content(image))
 
         return [{"role": "user", "content": content}]
 
