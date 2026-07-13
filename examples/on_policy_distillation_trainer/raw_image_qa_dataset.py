@@ -14,8 +14,9 @@
 """Runtime adapter for raw image QA parquet rows.
 
 The base RLHFDataset already handles parquet loading, concatenation, length
-filtering, and collation. This adapter only maps rows shaped as
-image/problem/answer into the chat-message fields expected by verl rollout.
+filtering, and collation. This adapter maps raw image QA rows into the
+chat-message fields expected by verl and optionally carries an offline model
+response for direct distillation.
 """
 
 import os
@@ -52,6 +53,7 @@ class RawImageQADataset(RLHFDataset):
             data_files = args[0]
 
         self.answer_key = config.get("answer_key", "answer") if config is not None else "answer"
+        self.response_key = config.get("response_key", "response") if config is not None else "response"
         self.default_data_source = self._resolve_default_data_source(config, data_files)
         self.image_min_pixels = (
             int(config.get("image_min_pixels"))
@@ -142,9 +144,18 @@ class RawImageQADataset(RLHFDataset):
         problem = str(problem).replace("<image>", "").strip()
         return self.prompt_template.format(problem=problem, instruction=self.prompt_instruction).strip()
 
+    def _get_image_payload(self, example: dict) -> Any:
+        if self.image_key in example and example[self.image_key] is not None:
+            return example[self.image_key]
+        # Keep both the original PAPO `image` column and datasets that expose
+        # an `images` list usable without rewriting parquet files.
+        fallback_key = "image" if self.image_key == "images" else "images"
+        return example.get(fallback_key)
+
     def _build_messages(self, example: dict, key: str):
         prompt_text = self._render_prompt(example.get(key, ""))
-        images = self._as_image_list(example.get(self.image_key, None))
+        images = self._as_image_list(self._get_image_payload(example))
+        image_slot_count = prompt_text.count("<image>")
         image_offset = 0
         content = []
 
@@ -152,17 +163,22 @@ class RawImageQADataset(RLHFDataset):
             if not segment:
                 continue
             if segment == "<image>":
-                if image_offset < len(images):
-                    content.append(self._to_limited_image_content(images[image_offset]))
-                    image_offset += 1
+                # The default template has one visual slot. When a row contains
+                # multiple images, place all of them at that slot in source order.
+                if image_slot_count == 1:
+                    images_for_slot = images[image_offset:]
+                else:
+                    images_for_slot = images[image_offset : image_offset + 1]
+                content.extend(self._to_limited_image_content(image) for image in images_for_slot)
+                image_offset += len(images_for_slot)
                 continue
             content.append({"type": "text", "text": segment})
 
         if image_offset == 0 and images:
-            content = [self._to_limited_image_content(images[0]), *content]
-            image_offset = 1
+            content = [self._to_limited_image_content(image) for image in images] + content
+            image_offset = len(images)
         for image in images[image_offset:]:
-            content.insert(0, self._to_limited_image_content(image))
+            content.append(self._to_limited_image_content(image))
 
         return [{"role": "user", "content": content}]
 
@@ -201,6 +217,9 @@ class RawImageQADataset(RLHFDataset):
     def __getitem__(self, item):
         row_dict: dict = self.dataframe[item]
         answer = row_dict.get(self.answer_key, "")
+        response = row_dict.get(self.response_key)
+        if response is None and self.config.get("response_key") is not None:
+            raise KeyError(f"Dataset row {item} is missing response field {self.response_key!r}.")
         extra_info = row_dict.get("extra_info") or {}
         if not isinstance(extra_info, dict):
             extra_info = {}
@@ -208,7 +227,7 @@ class RawImageQADataset(RLHFDataset):
         extra_info.setdefault("question", str(row_dict.get(self.prompt_key, "")))
         extra_info.setdefault("answer", str(answer))
 
-        return {
+        output = {
             "raw_prompt": self._build_messages(row_dict, key=self.prompt_key),
             "data_source": row_dict.get("data_source", self.default_data_source),
             "ability": row_dict.get("ability", "visual_reasoning"),
@@ -219,3 +238,6 @@ class RawImageQADataset(RLHFDataset):
             "tools_kwargs": extra_info.get("tools_kwargs", {}),
             "interaction_kwargs": extra_info.get("interaction_kwargs", {}),
         }
+        if response is not None:
+            output[self.response_key] = str(response)
+        return output

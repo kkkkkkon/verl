@@ -110,9 +110,20 @@ class PPOTrainer(ABC):
 
     def __init__(self, config: DictConfig):
         self.config = config
+        self.offline_response = bool(config.get("distillation", {}).get("offline_response", False))
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
+        if self.offline_response:
+            if not self.use_teacher_policy:
+                raise ValueError("distillation.offline_response=True requires distillation.enabled=True.")
+            if self.use_critic or self.use_reference_policy:
+                raise ValueError("Offline response distillation does not use a critic or reference policy.")
+            if self.config.trainer.get("val_before_train", True) or self.config.trainer.get("test_freq", -1) > 0:
+                raise ValueError(
+                    "Offline response distillation does not create a student rollout server, so generated-response "
+                    "validation is unavailable. Set trainer.val_before_train=False and trainer.test_freq=-1."
+                )
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
@@ -164,7 +175,10 @@ class PPOTrainer(ABC):
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # 1. define actor and rollout class
-        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        if self.offline_response:
+            actor_role = Role.Actor
+        else:
+            actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
         actor_rollout_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[actor_role],
@@ -267,30 +281,39 @@ class PPOTrainer(ABC):
             self.teacher_model_manager = None
             self.distillation_config = None
 
-        # 9. initialize agent loop manager
-        self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
-        )
+        self.llm_server_manager = None
+        self.checkpoint_manager = None
+        if self.offline_response:
+            logger.info("offline response distillation enabled; student rollout server is not created")
+        else:
+            # 9. initialize agent loop manager
+            self.llm_server_manager = LLMServerManager.create(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rollout_resource_pool=actor_rollout_resource_pool,
+            )
 
-        # 10. initialize checkpoint engine manager
-        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        checkpoint_engine_config.backend = "naive"
-        self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
-            config=checkpoint_engine_config,
-            actor_wg=self.actor_rollout_wg,
-            replicas=self.llm_server_manager.get_replicas(),
-        )
-        logger.info("checkpoint engine manager initialized")
+            # 10. initialize checkpoint engine manager
+            checkpoint_engine_config = omega_conf_to_dataclass(
+                self.config.actor_rollout_ref.rollout.checkpoint_engine
+            )
+            checkpoint_engine_config.backend = "naive"
+            self.checkpoint_manager = CheckpointEngineManager(
+                config=checkpoint_engine_config,
+                actor_wg=self.actor_rollout_wg,
+                replicas=self.llm_server_manager.get_replicas(),
+            )
+            logger.info("checkpoint engine manager initialized")
 
-        # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
+            # sleep all replicas to load checkpoint
+            self.checkpoint_manager.sleep_replicas()
         self._load_checkpoint()
 
         logger.info("all initialize finished, ready to fit")
 
-    def get_llm_client(self) -> LLMServerClient:
+    def get_llm_client(self) -> Optional[LLMServerClient]:
         """Get the LLM server client for rollout generation."""
-        return self.llm_server_manager.get_client()
+        return self.llm_server_manager.get_client() if self.llm_server_manager is not None else None
 
     def get_teacher_client(self) -> Optional[dict[str, LLMServerClient]]:
         """Get the On-Policy Distillation teacher server clients.
@@ -410,6 +433,9 @@ class PPOTrainer(ABC):
         self._shutdown_dump_executor()
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        if self.offline_response:
+            return self._offline_response_step(metrics, timing_raw)
+
         # 1. add batch to generate
         self._add_batch_to_generate()
 
@@ -461,6 +487,25 @@ class PPOTrainer(ABC):
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
 
+        return batch
+
+    def _offline_response_step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        """Run one direct distillation update from dataset-provided responses."""
+        self._add_batch_to_generate()
+
+        with marked_timer("data", timing_raw, color="red"):
+            batch, off_policy_metrics = self.replay_buffer.sample(
+                global_steps=self.global_steps,
+                partition_id="train",
+                batch_size=self.config.data.train_batch_size,
+            )
+            metrics.update(off_policy_metrics)
+            batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
+        batch = self._balance_batch(batch, metrics=metrics)
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            with marked_timer("update_actor", timing_raw, color="red"):
+                batch = self._update_actor(batch, metrics=metrics)
         return batch
 
     # ------------------------------ abstract methods ------------------------------
@@ -588,7 +633,10 @@ class PPOTrainer(ABC):
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
-        role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+        if self.offline_response:
+            role = Role.Actor
+        else:
+            role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
         self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
         self.mapping[role] = "global_pool"
 
@@ -1460,6 +1508,9 @@ class PPOTrainer(ABC):
         return batch
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
+        if self.offline_response:
+            return self._compute_offline_response_metrics(batch, metrics, timing_raw, global_steps, epoch)
+
         # 1. collect necessary fields from TransferQueue for computing metrics
         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
         fields = [
@@ -1547,14 +1598,6 @@ class PPOTrainer(ABC):
         metrics.update(compute_spec_decode_metrics(spec_drafts, spec_accepts, spec_verifies, non_padding_mask))
 
         # 5. off-policy staleness metrics
-        #   - trajectory_spans: how many distinct model versions a single trajectory was
-        #     generated across (1 == fully generated on a single version). This captures the
-        #     within-trajectory policy inconsistency caused by partial rollout / continuation.
-        #   - trajectory_staleness: how many training steps the trajectory lags behind the
-        #     *current* policy. A trajectory spans versions [min_global_steps, max_global_steps],
-        #     so the lag is a range: the freshest weights used give the lower bound
-        #     (global_steps - max_global_steps) and the oldest weights the worst case
-        #     (global_steps - min_global_steps). We log the lower bound as the primary metric.
         trajectory_spans = (max_global_steps - min_global_steps + 1) / self.parameter_sync_step
         trajectory_staleness = ((global_steps - 1) - max_global_steps) / self.parameter_sync_step
         trajectory_staleness_worst = ((global_steps - 1) - min_global_steps) / self.parameter_sync_step
@@ -1570,6 +1613,55 @@ class PPOTrainer(ABC):
                 "training/off_policy/trajectory_staleness_worst/max": trajectory_staleness_worst.max(),
                 "training/off_policy/trajectory_staleness_worst/min": trajectory_staleness_worst.min(),
             }
+        )
+
+    def _compute_offline_response_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
+        """Log sequence and throughput metrics without PPO-only reward fields."""
+        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
+        data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["prompts", "responses", "response_mask", "num_turns"],
+        )
+        prompt_length = data["prompts"].offsets().diff()
+        response_length = data["response_mask"].offsets().diff()
+        num_turns = np.asarray(data["num_turns"].tolist(), dtype=float)
+        if non_padding_mask.any():
+            prompt_length = prompt_length[non_padding_mask]
+            response_length = response_length[non_padding_mask]
+            num_turns = num_turns[non_padding_mask]
+
+        global_token_num = (prompt_length + response_length).tolist()
+        metric_batch = DataProto(
+            batch=TensorDict(
+                {
+                    "prompt_length": prompt_length.float(),
+                    "response_length": response_length.float(),
+                },
+                batch_size=len(prompt_length),
+            ),
+            meta_info={"global_token_num": global_token_num},
+        )
+        metrics.update(
+            {
+                "training/global_step": global_steps,
+                "training/epoch": epoch,
+                "training/prompt_length/mean": prompt_length.float().mean().item(),
+                "training/prompt_length/max": prompt_length.max().item(),
+                "training/prompt_length/min": prompt_length.min().item(),
+                "training/response_length/mean": response_length.float().mean().item(),
+                "training/response_length/max": response_length.max().item(),
+                "training/response_length/min": response_length.min().item(),
+                "training/num_turns/mean": num_turns.mean(),
+            }
+        )
+        metrics.update(compute_timing_metrics(batch=metric_batch, timing_raw=timing_raw))
+        metrics.update(
+            compute_throughout_metrics(
+                batch=metric_batch,
+                timing_raw=timing_raw,
+                n_gpus=self.resource_pool_manager.get_n_gpus(),
+            )
         )
 
 

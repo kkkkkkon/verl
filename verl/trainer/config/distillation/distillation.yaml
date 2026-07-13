@@ -13,6 +13,10 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
+# Train from dataset-provided responses without creating a student rollout
+# server. This mode requires task rewards and policy gradient to be disabled.
+offline_response: false
+
 # distillation loss config
 distillation_loss:
 
@@ -26,8 +30,24 @@ distillation_loss:
   # If distillation loss requires top-k logits, this is the value of k
   topk: 32
 
-  # Support construction mode for top-k distillation losses: prob or prob_perception
+  # Support selection mode for top-k distillation losses.
+  # "prob" keeps the original teacher-probability top-k behavior.
+  # "prob_perception" combines top-k/2 full-image probability ids with
+  # top-k/2 unique ids ranked by full-image minus masked-image teacher scores.
   topk_mode: prob
+
+  # Restrict perception selection to the normal-image teacher probability
+  # top-M. The teacher server returns M candidates, while the final support
+  # still has exactly `topk` entries.
+  perception_candidate_topk: 128
+
+  # null enables a tail bucket automatically for prob_perception, reverse_kl,
+  # and mixed_kl,
+  # while preserving legacy forward_kl_topk behavior in prob mode.
+  use_tail_bucket: null
+
+  # For mixed_kl: alpha * forward_KL + (1 - alpha) * reverse_KL.
+  kl_mix_alpha: 0.5
 
   # Whether to include task rewards alongside distillation loss.
   use_task_rewards: true

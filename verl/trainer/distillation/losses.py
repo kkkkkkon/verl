@@ -141,6 +141,14 @@ def compute_topk_loss(
 
             distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
+            if distillation_config.distillation_loss.loss_mode in {
+                "reverse_kl",
+                "mixed_kl",
+                "forward_reverse_kl",
+            }:
+                raise NotImplementedError(
+                    "Reverse or mixed top-k KL distillation is currently implemented for FSDP."
+                )
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
@@ -296,9 +304,12 @@ def distillation_loss(
     return distillation_loss, distillation_metrics
 
 
-@register_distillation_loss(
-    DistillationLossSettings(names=["forward_kl_topk", "reverse_kl"], use_topk=True)
-)  # type: ignore[arg-type]
+@register_distillation_loss(  # type: ignore[arg-type]
+    DistillationLossSettings(
+        names=["forward_kl_topk", "forward_kl", "reverse_kl", "mixed_kl", "forward_reverse_kl"],
+        use_topk=True,
+    )
+)
 def compute_forward_kl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -315,6 +326,14 @@ def compute_forward_kl_topk(
     distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
     student_mass = no_padding_2_padding(model_output["student_mass"], data)
     teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
+    perception_teacher_mass = model_output.get("perception_teacher_mass")
+    if perception_teacher_mass is not None:
+        perception_teacher_mass = no_padding_2_padding(perception_teacher_mass, data)
+    forward_kl_losses = model_output.get("forward_kl_losses")
+    reverse_kl_losses = model_output.get("reverse_kl_losses")
+    if forward_kl_losses is not None and reverse_kl_losses is not None:
+        forward_kl_losses = no_padding_2_padding(forward_kl_losses, data)
+        reverse_kl_losses = no_padding_2_padding(reverse_kl_losses, data)
     overlap_count = model_output.get("overlap_count")
     overlap_token_advantage = model_output.get("overlap_token_advantage")
     if overlap_count is not None and overlap_token_advantage is not None:
@@ -356,6 +375,29 @@ def compute_forward_kl_topk(
         "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass.max()),
         **overlap_metrics,
     }
+    if perception_teacher_mass is not None:
+        perception_teacher_mass = perception_teacher_mass[response_mask_bool]
+        perception_width = distillation_config.distillation_loss.topk // 2
+        distillation_metrics.update(
+            {
+                "distillation/perception_teacher_mass": perception_teacher_mass.mean().item(),
+                "distillation/perception_teacher_mean_probability": (
+                    perception_teacher_mass.mean() / perception_width
+                ).item(),
+                "distillation/perception_teacher_mass_fraction": (
+                    perception_teacher_mass / teacher_mass.clamp_min(torch.finfo(torch.float32).eps)
+                )
+                .mean()
+                .item(),
+            }
+        )
+    if forward_kl_losses is not None and reverse_kl_losses is not None:
+        distillation_metrics.update(
+            {
+                "distillation/forward_kl_component": forward_kl_losses[response_mask_bool].mean().item(),
+                "distillation/reverse_kl_component": reverse_kl_losses[response_mask_bool].mean().item(),
+            }
+        )
 
     # Due to use of top-k, student and teacher distributions don't sum to 1 -> divergences can be negative.
     distillation_losses = distillation_losses.clamp_min(0.0)

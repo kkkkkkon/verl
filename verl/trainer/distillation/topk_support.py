@@ -28,105 +28,129 @@ def validate_topk_mode(topk_mode: str) -> None:
 
 
 def split_prob_perception_topk(topk: int) -> tuple[int, int]:
-    if topk <= 0:
-        raise ValueError(f"topk must be positive for prob_perception, got {topk}.")
-    if topk % 2 != 0:
-        raise ValueError(f"prob_perception requires an even topk so support can be split evenly, got {topk}.")
+    if topk < 2 or topk % 2 != 0:
+        raise ValueError(f"prob_perception topk must be an even integer >= 2, got {topk}.")
     prob_topk = topk // 2
     perception_topk = topk - prob_topk
     return prob_topk, perception_topk
 
 
-def build_topk_support_ids(
-    teacher_logits_img: torch.Tensor,
-    *,
-    topk: int,
-    topk_mode: str = TOPK_MODE_PROB,
-    teacher_logits_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Build distillation support token ids from teacher logits.
-
-    ``prob`` preserves the existing behavior: use teacher full-image probability top-k.
-    ``prob_perception`` concatenates half probability top-k ids and half ids from
-    ``teacher_logits_img - teacher_logits_mask``. Duplicates are intentionally kept.
-    """
-
-    validate_topk_mode(topk_mode)
-    if topk_mode == TOPK_MODE_PROB:
-        return torch.topk(teacher_logits_img, k=topk, dim=-1).indices
-
-    if teacher_logits_mask is None:
-        raise ValueError("teacher_logits_mask is required when topk_mode='prob_perception'.")
-    if teacher_logits_mask.shape != teacher_logits_img.shape:
+def _validate_candidate_topk(candidate_topk: int, topk: int, available: int) -> int:
+    if candidate_topk <= topk:
         raise ValueError(
-            f"teacher_logits_mask shape must match teacher_logits_img shape, got "
-            f"{teacher_logits_mask.shape=} and {teacher_logits_img.shape=}."
+            "perception_candidate_topk must be > topk so perception ranking has a nontrivial candidate pool, "
+            f"got {candidate_topk=} and {topk=}."
         )
+    if candidate_topk > available:
+        raise ValueError(
+            f"perception_candidate_topk ({candidate_topk}) exceeds the number of available candidates ({available})."
+        )
+    return candidate_topk
 
+
+def _lookup_topk_logprobs_by_id(
+    query_ids: torch.Tensor,
+    reference_ids: torch.Tensor,
+    reference_logprobs: torch.Tensor,
+) -> torch.Tensor:
+    """Match top-k token ids without allocating an [..., query_k, reference_k] tensor."""
+    sorted_ids, order = torch.sort(reference_ids, dim=-1)
+    sorted_logprobs = torch.gather(reference_logprobs, dim=-1, index=order)
+    positions = torch.searchsorted(sorted_ids, query_ids)
+    safe_positions = positions.clamp_max(sorted_ids.size(-1) - 1)
+    found_ids = torch.gather(sorted_ids, dim=-1, index=safe_positions)
+    found_logprobs = torch.gather(sorted_logprobs, dim=-1, index=safe_positions)
+    matched = (positions < sorted_ids.size(-1)) & (found_ids == query_ids)
+
+    # Tokens missing from the masked top-k lie below its final entry. Using
+    # that entry is conservative and avoids promoting an unobserved tail.
+    masked_floor = reference_logprobs.min(dim=-1, keepdim=True).values
+    return torch.where(matched, found_logprobs, masked_floor.expand_as(found_logprobs))
+
+
+def build_prob_perception_support_from_logits(
+    teacher_logits_img: torch.Tensor,
+    teacher_logits_mask: torch.Tensor,
+    topk: int,
+    perception_candidate_topk: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a unique fixed-width support and full-image teacher targets."""
+    if teacher_logits_img.shape != teacher_logits_mask.shape:
+        raise ValueError(
+            "teacher_logits_img and teacher_logits_mask must have the same shape, "
+            f"got {teacher_logits_img.shape=} and {teacher_logits_mask.shape=}."
+        )
     prob_topk, perception_topk = split_prob_perception_topk(topk)
-    prob_ids = torch.topk(teacher_logits_img, k=prob_topk, dim=-1).indices
-    perception_score = teacher_logits_img - teacher_logits_mask
-    perception_ids = torch.topk(perception_score, k=perception_topk, dim=-1).indices
-    return torch.cat([prob_ids, perception_ids], dim=-1)
+    candidate_topk = min(perception_candidate_topk, teacher_logits_img.size(-1))
+    _validate_candidate_topk(candidate_topk, topk, teacher_logits_img.size(-1))
+
+    candidate_logits_img, candidate_ids = torch.topk(
+        teacher_logits_img, k=candidate_topk, dim=-1, sorted=True
+    )
+    prob_ids = candidate_ids[..., :prob_topk]
+    candidate_logits_mask = torch.gather(teacher_logits_mask, dim=-1, index=candidate_ids)
+    perception_score = candidate_logits_img - candidate_logits_mask
+    perception_score = perception_score.clone()
+    perception_score[..., :prob_topk] = float("-inf")
+    perception_positions = torch.topk(perception_score, k=perception_topk, dim=-1).indices
+    perception_ids = torch.gather(candidate_ids, dim=-1, index=perception_positions)
+    support_ids = torch.cat([prob_ids, perception_ids], dim=-1)
+
+    teacher_log_probs_img = F.log_softmax(teacher_logits_img, dim=-1)
+    support_log_probs = torch.gather(teacher_log_probs_img, dim=-1, index=support_ids)
+    return support_ids, support_log_probs
 
 
-def gather_teacher_logprobs_from_support(teacher_logits_img: torch.Tensor, support_ids: torch.Tensor) -> torch.Tensor:
-    """Gather the teacher full-image target distribution on ``support_ids``."""
-
-    teacher_log_probs = F.log_softmax(teacher_logits_img, dim=-1)
-    return torch.gather(teacher_log_probs, dim=-1, index=support_ids)
-
-
-def build_prob_perception_support_from_topk_outputs(
+def build_prob_perception_support_from_topk_logprobs(
     teacher_ids_img: torch.Tensor,
     teacher_logprobs_img: torch.Tensor,
     teacher_ids_mask: torch.Tensor,
     teacher_logprobs_mask: torch.Tensor,
-    *,
     topk: int,
+    perception_candidate_topk: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build prob_perception support from prompt-logprobs backends.
+    """Build prob/perception support from backend-returned top-k logprobs.
 
-    Current async teacher servers expose top-k prompt logprobs instead of full
-    vocab logits. This helper keeps targets from the full-image forward pass and
-    ranks perception ids within the available full-image top-k support.
+    Perception candidates are restricted to the normal-image probability top-M.
+    Masked logprobs are matched by token id without a quadratic match tensor.
     """
-
     if teacher_ids_img.shape != teacher_logprobs_img.shape:
         raise ValueError(
-            f"teacher_ids_img and teacher_logprobs_img must have the same shape, got "
-            f"{teacher_ids_img.shape} and {teacher_logprobs_img.shape}."
+            "teacher_ids_img and teacher_logprobs_img must have the same shape, "
+            f"got {teacher_ids_img.shape=} and {teacher_logprobs_img.shape=}."
         )
     if teacher_ids_mask.shape != teacher_logprobs_mask.shape:
         raise ValueError(
-            f"teacher_ids_mask and teacher_logprobs_mask must have the same shape, got "
-            f"{teacher_ids_mask.shape} and {teacher_logprobs_mask.shape}."
+            "teacher_ids_mask and teacher_logprobs_mask must have the same shape, "
+            f"got {teacher_ids_mask.shape=} and {teacher_logprobs_mask.shape=}."
         )
     if teacher_ids_img.shape[:-1] != teacher_ids_mask.shape[:-1]:
         raise ValueError(
-            f"Full-image and masked teacher outputs must have matching token dimensions, got "
-            f"{teacher_ids_img.shape[:-1]} and {teacher_ids_mask.shape[:-1]}."
+            "full-image and masked-image top-k tensors must share leading dims, "
+            f"got {teacher_ids_img.shape=} and {teacher_ids_mask.shape=}."
         )
 
     prob_topk, perception_topk = split_prob_perception_topk(topk)
-    if teacher_ids_img.shape[-1] < topk:
-        raise ValueError(f"prob_perception prompt-logprobs path requires at least {topk} full-image ids.")
-    if teacher_ids_mask.shape[-1] < 1:
-        raise ValueError("prob_perception prompt-logprobs path requires masked-image logprobs.")
+    candidate_topk = _validate_candidate_topk(perception_candidate_topk, topk, teacher_ids_img.size(-1))
+    candidate_logprobs, candidate_positions = torch.topk(
+        teacher_logprobs_img, k=candidate_topk, dim=-1, sorted=True
+    )
+    candidate_ids = torch.gather(teacher_ids_img, dim=-1, index=candidate_positions)
+    prob_ids = candidate_ids[..., :prob_topk]
+    prob_logprobs = candidate_logprobs[..., :prob_topk]
 
-    prob_ids = teacher_ids_img[..., :prob_topk]
-    prob_logprobs = teacher_logprobs_img[..., :prob_topk]
-
-    matches = teacher_ids_img.unsqueeze(-1) == teacher_ids_mask.unsqueeze(-2)
-    missing = torch.full_like(teacher_logprobs_img, -float("inf"))
-    masked_logprobs_on_img_support = torch.where(
-        matches,
-        teacher_logprobs_mask.unsqueeze(-2),
-        missing.unsqueeze(-1),
-    ).max(dim=-1).values
-    perception_score = teacher_logprobs_img - masked_logprobs_on_img_support
+    matched_mask_logprobs = _lookup_topk_logprobs_by_id(
+        query_ids=candidate_ids,
+        reference_ids=teacher_ids_mask,
+        reference_logprobs=teacher_logprobs_mask,
+    )
+    perception_score = candidate_logprobs - matched_mask_logprobs
+    perception_score = perception_score.clone()
+    perception_score[..., :prob_topk] = float("-inf")
     perception_positions = torch.topk(perception_score, k=perception_topk, dim=-1).indices
-    perception_ids = torch.gather(teacher_ids_img, dim=-1, index=perception_positions)
-    perception_logprobs = torch.gather(teacher_logprobs_img, dim=-1, index=perception_positions)
+    perception_ids = torch.gather(candidate_ids, dim=-1, index=perception_positions)
+    perception_logprobs = torch.gather(candidate_logprobs, dim=-1, index=perception_positions)
 
-    return torch.cat([prob_ids, perception_ids], dim=-1), torch.cat([prob_logprobs, perception_logprobs], dim=-1)
+    support_ids = torch.cat([prob_ids, perception_ids], dim=-1)
+    support_logprobs = torch.cat([prob_logprobs, perception_logprobs], dim=-1)
+    return support_ids, support_logprobs

@@ -31,8 +31,12 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics
+from verl.trainer.ppo.offline_response import split_offline_response_tokens
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
+from verl.utils.tokenizer.chat_template import apply_chat_template as render_chat_template
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -50,6 +54,93 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         super().__init__(*args, **kwargs)
         tq.init()
         self.background_tasks = set()
+        self.offline_response = bool(self.config.distillation.get("offline_response", False))
+        self.response_key = self.config.data.get("response_key", "response")
+
+    async def _apply_full_chat_template(
+        self,
+        messages: list[dict],
+        *,
+        images=None,
+        videos=None,
+        audios=None,
+        mm_processor_kwargs=None,
+    ) -> list[int]:
+        if self.processor is not None:
+            raw_sequence = await self.loop.run_in_executor(
+                None,
+                lambda: render_chat_template(
+                    self.processor,
+                    messages,
+                    add_generation_prompt=False,
+                    tokenize=False,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+            model_inputs = build_multimodal_processor_inputs(
+                self.processor,
+                text=[raw_sequence],
+                images=images,
+                videos=videos,
+                audio=audios,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+            return normalize_token_ids(model_inputs.pop("input_ids"))
+
+        tokenized_sequence = await self.loop.run_in_executor(
+            None,
+            lambda: render_chat_template(
+                self.tokenizer,
+                messages,
+                add_generation_prompt=False,
+                tokenize=True,
+                **self.apply_chat_template_kwargs,
+            ),
+        )
+        return normalize_token_ids(tokenized_sequence)
+
+    async def _build_offline_response_output(self, prompt: dict) -> AgentLoopOutput:
+        response = prompt.get(self.response_key)
+        if response is None:
+            raise KeyError(f"Offline response distillation requires dataset field {self.response_key!r}.")
+
+        messages = list(prompt["raw_prompt"])
+        multi_modal_data = await self.process_multi_modal_info(messages)
+        images = multi_modal_data.get("images")
+        videos = multi_modal_data.get("videos")
+        audios = multi_modal_data.get("audios")
+        mm_processor_kwargs = self._get_mm_processor_kwargs(audios)
+
+        prompt_ids = await self.apply_chat_template(
+            messages,
+            images=images,
+            videos=videos,
+            audios=audios,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        full_messages = [*messages, {"role": "assistant", "content": str(response)}]
+        full_ids = await self._apply_full_chat_template(
+            full_messages,
+            images=images,
+            videos=videos,
+            audios=audios,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        response_ids = split_offline_response_tokens(
+            prompt_ids=prompt_ids,
+            full_ids=full_ids,
+            max_response_length=self.rollout_config.response_length,
+        )
+        return AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            response_mask=[1] * len(response_ids),
+            multi_modal_data=multi_modal_data,
+            mm_processor_kwargs=mm_processor_kwargs,
+            num_turns=2,
+            metrics=AgentLoopMetrics(),
+            extra_fields={"turn_scores": [], "tool_rewards": []},
+        )
 
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
@@ -104,6 +195,19 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
         try:
+            if self.offline_response:
+                output = await self._build_offline_response_output(prompt)
+                postprocess_kwargs = dict(prompt)
+                postprocess_kwargs.pop(self.response_key, None)
+                await self._agent_loop_postprocess(
+                    output,
+                    validate=trajectory["validate"],
+                    session_id=0,
+                    **postprocess_kwargs,
+                )
+                await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
+                return
+
             # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
             config = self.config.actor_rollout_ref.rollout
             n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)

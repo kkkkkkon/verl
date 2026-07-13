@@ -37,10 +37,20 @@ class DistillationLossConfig(BaseConfig):
     topk (int, optional):
         Number of top tokens to consider for top-k distillation losses.
     topk_mode (str):
-        Support construction mode for top-k distillation losses. ``prob`` keeps
-        the teacher probability top-k behavior. ``prob_perception`` combines
-        probability top-k ids with ids selected by full-image minus masked-image
-        teacher logits.
+        Support selection mode for top-k distillation losses. "prob" keeps the
+        original teacher-probability top-k behavior. "prob_perception" builds
+        half of the support from teacher probability and half from full-image
+        minus masked-image teacher scores.
+    perception_candidate_topk (int):
+        Number of normal-image teacher probability candidates within which
+        perception tokens are selected. Only used by topk_mode="prob_perception".
+    use_tail_bucket (bool, optional):
+        Whether to aggregate support-excluded probability into one tail bucket
+        for top-k KL. None enables it for perception, reverse KL, and mixed KL
+        while preserving the original forward-KL behavior for topk_mode="prob".
+    kl_mix_alpha (float):
+        Forward-KL weight for loss_mode="mixed_kl". The reverse-KL weight is
+        1 - kl_mix_alpha.
     use_task_rewards (bool):
         Whether to include task rewards alongside distillation loss.
     distillation_loss_coef (float):
@@ -70,13 +80,16 @@ class DistillationLossConfig(BaseConfig):
     loss_mode: str = "k3"
     topk: Optional[int] = 128
     topk_mode: str = "prob"
+    perception_candidate_topk: int = 256
+    use_tail_bucket: Optional[bool] = None
+    kl_mix_alpha: float = 0.5
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
     # Chunked top-K log-probs (opt-in, avoids [B, T, V] log_softmax buffer
-    # at long context). Only consumed by ``loss_mode='forward_kl_topk'``.
+    # at long context). Consumed by all top-k KL loss modes.
     # Default ``False`` to preserve short-context performance (chunked path
     # has ~6x time overhead at N=14K, V=152K). Set ``True`` when hitting OOM
     # at long context (>=64K tokens, V=152K) where the baseline path OOMs.
@@ -115,12 +128,19 @@ class DistillationLossConfig(BaseConfig):
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
         validate_topk_mode(self.topk_mode)
+        if not 0.0 <= self.kl_mix_alpha <= 1.0:
+            raise ValueError(f"kl_mix_alpha must be in [0, 1], got {self.kl_mix_alpha}.")
         if self.topk_mode != TOPK_MODE_PROB and not self.loss_settings.use_topk:
             raise ValueError(f"distillation topk_mode={self.topk_mode!r} requires a top-k distillation loss.")
         if self.topk_mode == TOPK_MODE_PROB_PERCEPTION:
             if self.topk is None:
                 raise ValueError("topk must be specified when topk_mode='prob_perception'.")
             split_prob_perception_topk(self.topk)
+            if self.perception_candidate_topk <= self.topk:
+                raise ValueError(
+                    "topk_mode='prob_perception' requires perception_candidate_topk > "
+                    f"distillation_loss.topk, got {self.perception_candidate_topk} <= {self.topk}."
+                )
 
         if self.policy_loss_mode != "vanilla":
             raise NotImplementedError(
@@ -130,7 +150,7 @@ class DistillationLossConfig(BaseConfig):
 
         if self.use_policy_gradient and self.loss_settings.use_topk:
             print(
-                "WARNING: top-k distillation losses are most effective as supervised distillation losses "
+                f"WARNING: {self.loss_mode} is most effective as a supervised distillation loss "
                 "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
                 " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
                 "should move) is largely unused."
@@ -141,6 +161,22 @@ class DistillationLossConfig(BaseConfig):
                 "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
                 " wrt model weights does not depend on teacher log probabilities."
             )
+
+    @property
+    def teacher_logprob_topk(self) -> Optional[int]:
+        if self.topk_mode == "prob_perception":
+            return self.perception_candidate_topk
+        return self.topk
+
+    @property
+    def effective_use_tail_bucket(self) -> bool:
+        if self.use_tail_bucket is not None:
+            return self.use_tail_bucket
+        return self.topk_mode == "prob_perception" or self.loss_mode in {
+            "reverse_kl",
+            "mixed_kl",
+            "forward_reverse_kl",
+        }
 
 
 @dataclass
@@ -243,6 +279,9 @@ class DistillationConfig(BaseConfig):
 
     enabled (bool):
         Whether on-policy distillation is enabled.
+    offline_response (bool):
+        Whether to train from responses stored in the dataset instead of
+        sampling trajectories from the student rollout server.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -279,6 +318,7 @@ class DistillationConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
 
     enabled: bool = False
+    offline_response: bool = False
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
@@ -289,12 +329,20 @@ class DistillationConfig(BaseConfig):
         if not self.enabled:
             return
 
+        if self.offline_response and (
+            self.distillation_loss.use_task_rewards or self.distillation_loss.use_policy_gradient
+        ):
+            raise ValueError(
+                "distillation.offline_response=True requires "
+                "distillation_loss.use_task_rewards=False and use_policy_gradient=False."
+            )
+
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
-                topk=self.distillation_loss.topk,
+                topk=self.distillation_loss.teacher_logprob_topk,
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

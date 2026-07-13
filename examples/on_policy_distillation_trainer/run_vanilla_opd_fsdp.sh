@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Vanilla OPD baseline on raw image QA parquet data.
 #
-# This runner follows the DOPD paper's VLM implementation settings:
-#   - AdamW + cosine scheduler
-#   - lr = 5e-6
-#   - train batch size = 64
-#   - rollout samples = 4
-#   - max training steps = 300
-#   - top-k K = 128 when a top-k distillation loss is selected
+# Current experiment defaults:
+#   - AdamW + constant scheduler
+#   - lr = 1e-6
+#   - train batch size = 128
+#   - one greedy student rollout per prompt
+#   - 2 epochs
+#   - top-k K = 32 when a top-k distillation loss is selected
 #
-# It intentionally does not implement DOPD's dual/advantage-aware routing.
+# The student generates trajectories; the teacher only provides distillation targets.
 
 set -xeuo pipefail
 
@@ -32,6 +32,7 @@ VAL_DATA_SOURCE=${VAL_DATA_SOURCE:-hiyouga/validation}
 IMAGE_KEY=${IMAGE_KEY:-images}
 IMAGE_MIN_PIXELS=${IMAGE_MIN_PIXELS:-200704}
 IMAGE_MAX_PIXELS=${IMAGE_MAX_PIXELS:-1003520}
+RESPONSE_KEY=${RESPONSE_KEY:-response}
 PROMPT_INSTRUCTION=${PROMPT_INSTRUCTION:-"You FIRST think about the reasoning process as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE enclosed within <answer> </answer> tags."}
 PROMPT_TEMPLATE=${PROMPT_TEMPLATE:-"<image>
 {problem}
@@ -66,8 +67,11 @@ TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE:-$(( TEACHER_TP * TEACHER_NUM_REPLICAS )
 train_batch_size=${TRAIN_BATCH_SIZE:-128}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-128}
 val_max_samples=${VAL_MAX_SAMPLES:-512}
-rollout_n=${ROLLOUT_N:-4}
-# total_training_steps=${TOTAL_TRAINING_STEPS:-300}
+rollout_n=${ROLLOUT_N:-1}
+if [[ "$rollout_n" != 1 ]]; then
+    echo "Greedy rollout requires ROLLOUT_N=1, got: $rollout_n" >&2
+    exit 1
+fi
 total_epochs=${TOTAL_EPOCHS:-2}
 actor_lr=${ACTOR_LR:-1e-6}
 lr_warmup_steps_ratio=${LR_WARMUP_STEPS_RATIO:-0.0}
@@ -78,18 +82,99 @@ ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
 
 distillation_loss_mode=${DISTILLATION_LOSS_MODE:-forward_kl_topk}
 use_policy_gradient=${USE_POLICY_GRADIENT:-False}
+offline_response=${OFFLINE_RESPONSE:-False}
+case "$offline_response" in
+    True|true|TRUE|1|Yes|yes|YES) offline_response_enabled=True ;;
+    False|false|FALSE|0|No|no|NO) offline_response_enabled=False ;;
+    *)
+        echo "OFFLINE_RESPONSE must be True or False, got: $offline_response" >&2
+        exit 1
+        ;;
+esac
+if [[ "$offline_response_enabled" == True ]]; then
+    case "$use_policy_gradient" in
+        False|false|FALSE|0|No|no|NO) : ;;
+        *)
+            echo "OFFLINE_RESPONSE=True requires USE_POLICY_GRADIENT=False." >&2
+            exit 1
+            ;;
+    esac
+    rollout_temperature=1.0
+else
+    rollout_temperature=0
+fi
 distillation_topk=${DISTILLATION_TOPK:-32}
+kl_mix_alpha=${KL_MIX_ALPHA:-0.5}
+use_perception_score=${USE_PERCEPTION_SCORE:-False}
+if [[ -n "${TOPK_MODE:-}" ]]; then
+    topk_mode=${TOPK_MODE}
+else
+    case "$use_perception_score" in
+        True|true|TRUE|1|Yes|yes|YES) topk_mode=prob_perception ;;
+        False|false|FALSE|0|No|no|NO) topk_mode=prob ;;
+        *)
+            echo "USE_PERCEPTION_SCORE must be True or False, got: $use_perception_score" >&2
+            exit 1
+            ;;
+    esac
+fi
+if [[ -n "${PERCEPTION_CANDIDATE_TOPK:-}" ]]; then
+    perception_candidate_topk=${PERCEPTION_CANDIDATE_TOPK}
+elif (( distillation_topk < 64 )); then
+    perception_candidate_topk=128
+else
+    perception_candidate_topk=$(( distillation_topk * 2 ))
+fi
+use_tail_bucket=${USE_TAIL_BUCKET:-null}
+
+# ---- optional student LoRA (uses verl's native FSDP/PEFT path) ----
+use_student_lora=${USE_STUDENT_LORA:-False}
+student_lora_rank=${STUDENT_LORA_RANK:-64}
+student_lora_alpha=${STUDENT_LORA_ALPHA:-32}
+student_lora_target_modules=${STUDENT_LORA_TARGET_MODULES:-all-linear}
+student_lora_exclude_modules=${STUDENT_LORA_EXCLUDE_MODULES:-'.*visual.*'}
+case "$use_student_lora" in
+    True|true|TRUE|1|Yes|yes|YES) student_lora_enabled=True ;;
+    False|false|FALSE|0|No|no|NO) student_lora_enabled=False ;;
+    *)
+        echo "USE_STUDENT_LORA must be True or False, got: $use_student_lora" >&2
+        exit 1
+        ;;
+esac
+if [[ "$student_lora_enabled" == True ]]; then
+    if ! [[ "$student_lora_rank" =~ ^[1-9][0-9]*$ ]]; then
+        echo "STUDENT_LORA_RANK must be a positive integer, got: $student_lora_rank" >&2
+        exit 1
+    fi
+    if ! [[ "$student_lora_alpha" =~ ^[1-9][0-9]*$ ]]; then
+        echo "STUDENT_LORA_ALPHA must be a positive integer, got: $student_lora_alpha" >&2
+        exit 1
+    fi
+fi
 
 rollout_tp=${ROLLOUT_TP:-1}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.8}
 teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.8}
 
 save_freq=${SAVE_FREQ:-100}
-test_freq=${TEST_FREQ:-25}
+if [[ "$offline_response_enabled" == True ]]; then
+    test_freq=${TEST_FREQ:--1}
+else
+    test_freq=${TEST_FREQ:-25}
+fi
 val_before_train=${VAL_BEFORE_TRAIN:-False}
 logger=${LOGGER:-'["console","swanlab"]'}
 project_name=${PROJECT_NAME:-vanilla_opd}
-experiment_name=${EXPERIMENT_NAME:-${RUN_NAME}_${distillation_loss_mode}_vanilla}
+if [[ "$offline_response_enabled" == True && "$student_lora_enabled" == True ]]; then
+    default_experiment_name=${RUN_NAME}_${distillation_loss_mode}_lora_r${student_lora_rank}_perception_kd
+elif [[ "$offline_response_enabled" == True ]]; then
+    default_experiment_name=${RUN_NAME}_${distillation_loss_mode}_perception_kd
+elif [[ "$student_lora_enabled" == True ]]; then
+    default_experiment_name=${RUN_NAME}_${distillation_loss_mode}_lora_r${student_lora_rank}_greedy_n1_vanilla
+else
+    default_experiment_name=${RUN_NAME}_${distillation_loss_mode}_greedy_n1_vanilla
+fi
+experiment_name=${EXPERIMENT_NAME:-$default_experiment_name}
 
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 
@@ -165,6 +250,9 @@ DATA=(
     data.shuffle=True
     data.return_multi_modal_inputs=True
 )
+if [[ "$offline_response_enabled" == True ]]; then
+    DATA+=(+data.response_key="$RESPONSE_KEY")
+fi
 
 MODEL=(
     actor_rollout_ref.model.path="$STUDENT_MODEL"
@@ -189,10 +277,29 @@ ROLLOUT=(
     actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp}
     actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_mem_util}
     actor_rollout_ref.rollout.n=${rollout_n}
+    actor_rollout_ref.rollout.temperature=${rollout_temperature}
+    actor_rollout_ref.rollout.top_p=1.0
+    actor_rollout_ref.rollout.top_k=-1
+    actor_rollout_ref.rollout.do_sample=False
     actor_rollout_ref.rollout.max_model_len=${max_num_tokens}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
 )
+
+if [[ "$student_lora_enabled" == True ]]; then
+    MODEL+=(
+        actor_rollout_ref.model.lora_rank=${student_lora_rank}
+        actor_rollout_ref.model.lora_alpha=${student_lora_alpha}
+        actor_rollout_ref.model.target_modules="${student_lora_target_modules}"
+        actor_rollout_ref.model.exclude_modules="${student_lora_exclude_modules}"
+    )
+    if [[ "$offline_response_enabled" == False ]]; then
+        ROLLOUT+=(
+            actor_rollout_ref.rollout.load_format=safetensors
+            actor_rollout_ref.rollout.layered_summon=True
+        )
+    fi
+fi
 
 TRAINER=(
     trainer.balance_batch=True
@@ -215,15 +322,21 @@ REWARD=(
 
 DISTILL=(
     distillation.enabled=True
+    distillation.offline_response=${offline_response_enabled}
     distillation.n_gpus_per_node=${TEACHER_WORLD_SIZE}
     distillation.nnodes=${TEACHER_NNODES}
     distillation.teacher_models.teacher_model.model_path="$TEACHER_MODEL"
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=${TEACHER_TP}
     distillation.teacher_models.teacher_model.inference.name=vllm
+    distillation.teacher_models.teacher_model.inference.temperature=1.0
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=${teacher_gpu_mem_util}
     distillation.teacher_models.teacher_model.inference.max_model_len=${max_num_tokens}
     distillation.distillation_loss.loss_mode=${distillation_loss_mode}
     distillation.distillation_loss.topk=${distillation_topk}
+    distillation.distillation_loss.topk_mode=${topk_mode}
+    distillation.distillation_loss.perception_candidate_topk=${perception_candidate_topk}
+    distillation.distillation_loss.use_tail_bucket=${use_tail_bucket}
+    distillation.distillation_loss.kl_mix_alpha=${kl_mix_alpha}
     distillation.distillation_loss.use_task_rewards=False
     distillation.distillation_loss.use_policy_gradient=${use_policy_gradient}
     distillation.distillation_loss.loss_max_clamp=10.0

@@ -24,7 +24,7 @@ from torch.nn import functional as F
 
 from verl.trainer.distillation.topk_support import (
     TOPK_MODE_PROB_PERCEPTION,
-    build_prob_perception_support_from_topk_outputs,
+    build_prob_perception_support_from_topk_logprobs,
 )
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import (
@@ -54,7 +54,9 @@ def _get_teacher_sampling_params(
             "on prompt_logprobs (forward pass only). Using temperature=1.0.",
             teacher_model_config.inference.temperature,
         )
-    num_logprobs = distillation_loss_config.topk if distillation_loss_config.loss_settings.use_topk else 0
+    num_logprobs = (
+        distillation_loss_config.teacher_logprob_topk if distillation_loss_config.loss_settings.use_topk else 0
+    )
     return {
         "max_tokens": 1,
         "temperature": 1.0,
@@ -63,6 +65,8 @@ def _get_teacher_sampling_params(
 
 
 def _mask_image_payload(image: Any) -> Any:
+    if image is None:
+        return None
     if isinstance(image, Image.Image):
         return Image.new(image.mode, image.size)
     if isinstance(image, bytes):
@@ -101,6 +105,8 @@ def _mask_multi_modal_images(multi_modal_data: dict[str, Any]) -> dict[str, Any]
         return masked_data
     if isinstance(images, list):
         masked_data["images"] = [_mask_image_payload(image) for image in images]
+    elif isinstance(images, tuple):
+        masked_data["images"] = tuple(_mask_image_payload(image) for image in images)
     else:
         masked_data["images"] = _mask_image_payload(images)
     return masked_data
@@ -170,6 +176,7 @@ class AsyncTeacherLLMServerManager:
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        multi_modal_data = multi_modal_data or {}
         teacher_output = await client.generate(
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,
@@ -210,6 +217,9 @@ class AsyncTeacherLLMServerManager:
             self.distillation_loss_config.loss_settings.use_topk
             and self.distillation_loss_config.topk_mode == TOPK_MODE_PROB_PERCEPTION
         ):
+            image_data = multi_modal_data.get("images")
+            if image_data is None or (isinstance(image_data, (list, tuple)) and len(image_data) == 0):
+                raise ValueError("topk_mode='prob_perception' requires at least one image per sample.")
             masked_multi_modal_data = _mask_multi_modal_images(multi_modal_data)
             teacher_ids_mask, teacher_logprobs_mask = await self._generate_teacher_logprobs(
                 client=client,
@@ -218,11 +228,13 @@ class AsyncTeacherLLMServerManager:
                 multi_modal_data=masked_multi_modal_data,
                 mm_processor_kwargs=mm_processor_kwargs,
             )
-            teacher_ids, teacher_logprobs = build_prob_perception_support_from_topk_outputs(
-                teacher_ids,
-                teacher_logprobs,
-                teacher_ids_mask,
-                teacher_logprobs_mask,
+            teacher_ids, teacher_logprobs = build_prob_perception_support_from_topk_logprobs(
+                teacher_ids_img=teacher_ids,
+                teacher_logprobs_img=teacher_logprobs,
+                teacher_ids_mask=teacher_ids_mask,
+                teacher_logprobs_mask=teacher_logprobs_mask,
                 topk=self.distillation_loss_config.topk,
+                perception_candidate_topk=self.distillation_loss_config.perception_candidate_topk,
             )
+            teacher_ids = teacher_ids.to(torch.int32)
         return teacher_ids, teacher_logprobs

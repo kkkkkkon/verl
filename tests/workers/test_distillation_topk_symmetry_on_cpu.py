@@ -44,15 +44,26 @@ from tensordict import TensorDict
 from verl.trainer.distillation.fsdp.losses import compute_forward_kl_topk as compute_fsdp_forward_kl_topk
 from verl.trainer.distillation.losses import compute_forward_kl_topk as collect_forward_kl_topk_metrics
 from verl.trainer.distillation.topk_support import (
-    build_topk_support_ids,
-    gather_teacher_logprobs_from_support,
+    build_prob_perception_support_from_logits,
+    build_prob_perception_support_from_topk_logprobs,
 )
+from verl.trainer.ppo.offline_response import split_offline_response_tokens
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 
 _VOCAB_SIZE = 8
 _DISTILLATION_KEYS = ("distillation_losses", "student_mass", "overlap_count", "overlap_token_advantage")
+
+
+def test_split_offline_response_tokens_uses_generation_prompt_boundary():
+    prompt_ids = [10, 11, 12]
+    full_ids = [10, 11, 12, 20, 21, 22]
+
+    assert split_offline_response_tokens(prompt_ids, full_ids, max_response_length=2) == [20, 21]
+
+    with pytest.raises(ValueError, match="does not preserve the prompt generation prefix"):
+        split_offline_response_tokens(prompt_ids, [10, 99, 12, 20], max_response_length=4)
 
 
 def _make_engine_stub():
@@ -182,6 +193,150 @@ def _nested_from_rows(rows):
     return torch.nested.nested_tensor_from_jagged(values, offsets=offsets)
 
 
+def _nested_from_dense_topk(tensor):
+    values = tensor.reshape(-1, tensor.shape[-1])
+    offsets = torch.tensor([0, values.shape[0]], dtype=torch.int64)
+    return torch.nested.nested_tensor_from_jagged(values, offsets=offsets)
+
+
+def test_prob_perception_support_reverse_and_mixed_kl_are_finite():
+    torch.manual_seed(7)
+    bsz, seq_len, vocab_size, topk = 2, 3, 192, 32
+    half_topk = topk // 2
+    candidate_topk = 128
+
+    student_logits = torch.randn(bsz, seq_len, vocab_size)
+    teacher_logits_img = torch.randn(bsz, seq_len, vocab_size)
+    teacher_logits_mask = torch.randn(bsz, seq_len, vocab_size)
+    # This token has a huge image-minus-mask score but negligible normal-image
+    # probability. Candidate restriction must keep it out of the support.
+    teacher_logits_img[..., -1] = -50.0
+    teacher_logits_mask[..., -1] = -1000.0
+
+    support_ids, teacher_support_logprobs = build_prob_perception_support_from_logits(
+        teacher_logits_img=teacher_logits_img,
+        teacher_logits_mask=teacher_logits_mask,
+        topk=topk,
+        perception_candidate_topk=candidate_topk,
+    )
+
+    assert support_ids.shape == (bsz, seq_len, topk)
+    assert teacher_support_logprobs.shape == (bsz, seq_len, topk)
+    candidate_logits, candidate_ids = torch.topk(teacher_logits_img, k=candidate_topk, dim=-1)
+    expected_prob_ids = candidate_ids[..., :half_topk]
+    candidate_mask_logits = torch.gather(teacher_logits_mask, dim=-1, index=candidate_ids)
+    candidate_perception_score = candidate_logits - candidate_mask_logits
+    candidate_perception_score[..., :half_topk] = float("-inf")
+    expected_perception_positions = torch.topk(candidate_perception_score, k=half_topk, dim=-1).indices
+    expected_perception_ids = torch.gather(candidate_ids, dim=-1, index=expected_perception_positions)
+    assert torch.equal(support_ids[..., :half_topk], expected_prob_ids)
+    assert torch.equal(support_ids[..., half_topk:], expected_perception_ids)
+    assert not (support_ids == vocab_size - 1).any()
+    sorted_support_ids = torch.sort(support_ids, dim=-1).values
+    assert (sorted_support_ids[..., 1:] != sorted_support_ids[..., :-1]).all()
+
+    output = compute_fsdp_forward_kl_topk(
+        student_logits=student_logits.reshape(1, bsz * seq_len, vocab_size),
+        teacher_topk_log_probs=_nested_from_dense_topk(teacher_support_logprobs),
+        teacher_topk_ids=_nested_from_dense_topk(support_ids),
+        config=SimpleNamespace(
+            distillation_loss=SimpleNamespace(
+                log_prob_min_clamp=None,
+                loss_mode="reverse_kl",
+                topk_mode="prob_perception",
+                use_tail_bucket=None,
+                use_chunked_topk=False,
+            )
+        ),
+        data_format="thd",
+    )
+
+    assert output["distillation_losses"].shape == (1, bsz * seq_len)
+    assert torch.isfinite(output["distillation_losses"]).all()
+    assert (output["student_mass"] < 1.0).all()
+    assert (output["teacher_mass"] < 1.0).all()
+    assert torch.isfinite(output["perception_teacher_mass"]).all()
+
+    student_support_logprobs = torch.gather(
+        torch.log_softmax(student_logits, dim=-1), dim=-1, index=support_ids
+    )
+    student_mass = student_support_logprobs.exp().sum(dim=-1)
+    teacher_mass = teacher_support_logprobs.exp().sum(dim=-1)
+    support_reverse_kl = (
+        student_support_logprobs.exp() * (student_support_logprobs - teacher_support_logprobs)
+    ).sum(dim=-1)
+    eps = torch.finfo(torch.float32).eps
+    student_tail = (1.0 - student_mass).clamp_min(eps)
+    teacher_tail = (1.0 - teacher_mass).clamp_min(eps)
+    expected_reverse_kl = support_reverse_kl + student_tail * (student_tail.log() - teacher_tail.log())
+    torch.testing.assert_close(
+        output["distillation_losses"].reshape(bsz, seq_len), expected_reverse_kl, rtol=1e-5, atol=1e-6
+    )
+
+    mix_alpha = 0.3
+    mixed_output = compute_fsdp_forward_kl_topk(
+        student_logits=student_logits.reshape(1, bsz * seq_len, vocab_size),
+        teacher_topk_log_probs=_nested_from_dense_topk(teacher_support_logprobs),
+        teacher_topk_ids=_nested_from_dense_topk(support_ids),
+        config=SimpleNamespace(
+            distillation_loss=SimpleNamespace(
+                log_prob_min_clamp=None,
+                loss_mode="mixed_kl",
+                kl_mix_alpha=mix_alpha,
+                topk_mode="prob_perception",
+                use_tail_bucket=None,
+                use_chunked_topk=False,
+            )
+        ),
+        data_format="thd",
+    )
+    support_forward_kl = (
+        teacher_support_logprobs.exp() * (teacher_support_logprobs - student_support_logprobs)
+    ).sum(dim=-1)
+    expected_forward_kl = support_forward_kl + teacher_tail * (teacher_tail.log() - student_tail.log())
+    expected_mixed_kl = mix_alpha * expected_forward_kl + (1.0 - mix_alpha) * expected_reverse_kl
+    torch.testing.assert_close(
+        mixed_output["forward_kl_losses"].reshape(bsz, seq_len), expected_forward_kl, rtol=1e-5, atol=1e-6
+    )
+    torch.testing.assert_close(
+        mixed_output["reverse_kl_losses"].reshape(bsz, seq_len), expected_reverse_kl, rtol=1e-5, atol=1e-6
+    )
+    torch.testing.assert_close(
+        mixed_output["distillation_losses"].reshape(bsz, seq_len), expected_mixed_kl, rtol=1e-5, atol=1e-6
+    )
+
+
+def test_prob_perception_runtime_support_is_unique_and_fixed_width():
+    torch.manual_seed(11)
+    bsz, seq_len, vocab_size = 2, 3, 256
+    topk, candidate_topk = 32, 128
+    teacher_logits_img = torch.randn(bsz, seq_len, vocab_size)
+    teacher_logits_mask = torch.randn(bsz, seq_len, vocab_size)
+    teacher_logprobs_img = torch.log_softmax(teacher_logits_img, dim=-1)
+    teacher_logprobs_mask = torch.log_softmax(teacher_logits_mask, dim=-1)
+    img_logprobs, img_ids = torch.topk(teacher_logprobs_img, k=candidate_topk, dim=-1)
+    mask_logprobs, mask_ids = torch.topk(teacher_logprobs_mask, k=candidate_topk, dim=-1)
+
+    support_ids, support_logprobs = build_prob_perception_support_from_topk_logprobs(
+        teacher_ids_img=img_ids,
+        teacher_logprobs_img=img_logprobs,
+        teacher_ids_mask=mask_ids,
+        teacher_logprobs_mask=mask_logprobs,
+        topk=topk,
+        perception_candidate_topk=candidate_topk,
+    )
+
+    assert support_ids.shape == (bsz, seq_len, topk)
+    assert support_logprobs.shape == (bsz, seq_len, topk)
+    sorted_support_ids = torch.sort(support_ids, dim=-1).values
+    assert (sorted_support_ids[..., 1:] != sorted_support_ids[..., :-1]).all()
+    assert torch.equal(support_ids[..., : topk // 2], img_ids[..., : topk // 2])
+    assert torch.allclose(
+        support_logprobs,
+        torch.gather(teacher_logprobs_img, dim=-1, index=support_ids),
+    )
+
+
 def test_forward_kl_topk_emits_overlap_metrics():
     logits = torch.tensor(
         [
@@ -238,6 +393,8 @@ def test_forward_kl_topk_metric_aggregation_for_overlap_outputs():
         "teacher_mass": torch.tensor([0.95, 0.85, 0.75]),
         "overlap_count": torch.tensor([2, 1, 0]),
         "overlap_token_advantage": torch.tensor([-0.2, -0.4, 0.0]),
+        "forward_kl_losses": torch.tensor([1.0, 2.0, 9.0]),
+        "reverse_kl_losses": torch.tensor([3.0, 4.0, 9.0]),
     }
     distillation_config = SimpleNamespace(distillation_loss=SimpleNamespace(topk=2))
 
@@ -250,44 +407,5 @@ def test_forward_kl_topk_metric_aggregation_for_overlap_outputs():
 
     assert metrics["distillation/overlap_ratio"] == pytest.approx(0.75)
     assert metrics["distillation/overlap_token_advantage"] == pytest.approx(-0.3)
-
-
-def test_prob_perception_support_and_reverse_kl_on_cpu():
-    torch.manual_seed(0)
-    bsz, seqlen, vocab_size, topk = 2, 3, 64, 32
-    student_logits = torch.randn(bsz, seqlen, vocab_size)
-    teacher_logits_img = torch.randn(bsz, seqlen, vocab_size)
-    teacher_logits_mask = torch.randn(bsz, seqlen, vocab_size)
-
-    support_ids = build_topk_support_ids(
-        teacher_logits_img,
-        teacher_logits_mask=teacher_logits_mask,
-        topk=topk,
-        topk_mode="prob_perception",
-    )
-
-    assert support_ids.shape == (bsz, seqlen, topk)
-    perception_score = teacher_logits_img - teacher_logits_mask
-    expected_perception_ids = torch.topk(perception_score, k=topk // 2, dim=-1).indices
-    torch.testing.assert_close(support_ids[..., topk // 2 :], expected_perception_ids)
-
-    teacher_logprobs = gather_teacher_logprobs_from_support(teacher_logits_img, support_ids)
-    support_ids_nested = _nested_from_rows(support_ids.reshape(-1, topk).tolist()).to(torch.int64)
-    teacher_logprobs_nested = _nested_from_rows(teacher_logprobs.reshape(-1, topk).tolist()).to(torch.float32)
-    config = SimpleNamespace(
-        distillation_loss=SimpleNamespace(
-            log_prob_min_clamp=None,
-            loss_mode="reverse_kl",
-            use_chunked_topk=False,
-        )
-    )
-
-    output = compute_fsdp_forward_kl_topk(
-        student_logits=student_logits.reshape(1, bsz * seqlen, vocab_size),
-        teacher_topk_log_probs=teacher_logprobs_nested,
-        teacher_topk_ids=support_ids_nested,
-        config=config,
-        data_format="thd",
-    )
-
-    assert torch.isfinite(output["distillation_losses"]).all()
+    assert metrics["distillation/forward_kl_component"] == pytest.approx(1.5)
+    assert metrics["distillation/reverse_kl_component"] == pytest.approx(3.5)
