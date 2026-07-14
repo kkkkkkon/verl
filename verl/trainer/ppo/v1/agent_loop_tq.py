@@ -32,11 +32,14 @@ from verl.experimental.agent_loop import (
     get_trajectory_info,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics
-from verl.trainer.ppo.offline_response import process_offline_multi_modal_info, split_offline_response_tokens
+from verl.trainer.ppo.offline_response import (
+    apply_offline_chat_template,
+    process_offline_multi_modal_info,
+    split_offline_response_tokens,
+)
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
-from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
-from verl.utils.tokenizer.chat_template import apply_chat_template as render_chat_template
+from verl.utils.tokenizer import build_multimodal_processor_inputs
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -57,48 +60,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         self.offline_response = bool(self.config.distillation.get("offline_response", False))
         self.response_key = self.config.data.get("response_key", "response")
 
-    async def _apply_full_chat_template(
-        self,
-        messages: list[dict],
-        *,
-        images=None,
-        videos=None,
-        audios=None,
-        mm_processor_kwargs=None,
-    ) -> list[int]:
-        if self.processor is not None:
-            raw_sequence = await self.loop.run_in_executor(
-                None,
-                lambda: render_chat_template(
-                    self.processor,
-                    messages,
-                    add_generation_prompt=False,
-                    tokenize=False,
-                    **self.apply_chat_template_kwargs,
-                ),
-            )
-            model_inputs = build_multimodal_processor_inputs(
-                self.processor,
-                text=[raw_sequence],
-                images=images,
-                videos=videos,
-                audio=audios,
-                mm_processor_kwargs=mm_processor_kwargs,
-            )
-            return normalize_token_ids(model_inputs.pop("input_ids"))
-
-        tokenized_sequence = await self.loop.run_in_executor(
-            None,
-            lambda: render_chat_template(
-                self.tokenizer,
-                messages,
-                add_generation_prompt=False,
-                tokenize=True,
-                **self.apply_chat_template_kwargs,
-            ),
-        )
-        return normalize_token_ids(tokenized_sequence)
-
     async def _build_offline_response_output(self, prompt: dict) -> AgentLoopOutput:
         response = prompt.get(self.response_key)
         if response is None:
@@ -115,17 +76,35 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
         mm_processor_kwargs = self._get_mm_processor_kwargs(audios)
+        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
 
-        prompt_ids = await self.apply_chat_template(
+        prompt_ids = await apply_offline_chat_template(
             messages,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            add_generation_prompt=True,
+            apply_chat_template_kwargs=apply_chat_template_kwargs,
             images=images,
             videos=videos,
             audios=audios,
             mm_processor_kwargs=mm_processor_kwargs,
         )
+        if len(prompt_ids) > self.rollout_config.prompt_length:
+            if multi_modal_data:
+                raise ValueError(
+                    f"Multimodal prompt produced {len(prompt_ids)} tokens, exceeding "
+                    f"rollout.prompt_length={self.rollout_config.prompt_length}. Reduce the multimodal input "
+                    "size or increase MAX_PROMPT_LENGTH."
+                )
+            prompt_ids = prompt_ids[-self.rollout_config.prompt_length :]
+
         full_messages = [*messages, {"role": "assistant", "content": str(response)}]
-        full_ids = await self._apply_full_chat_template(
+        full_ids = await apply_offline_chat_template(
             full_messages,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            add_generation_prompt=False,
+            apply_chat_template_kwargs=apply_chat_template_kwargs,
             images=images,
             videos=videos,
             audios=audios,

@@ -48,7 +48,11 @@ from verl.trainer.distillation.topk_support import (
     build_prob_perception_support_from_logits,
     build_prob_perception_support_from_topk_logprobs,
 )
-from verl.trainer.ppo.offline_response import process_offline_multi_modal_info, split_offline_response_tokens
+from verl.trainer.ppo.offline_response import (
+    apply_offline_chat_template,
+    process_offline_multi_modal_info,
+    split_offline_response_tokens,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
@@ -92,6 +96,42 @@ def test_process_offline_multi_modal_info_uses_dataset_protocol_for_multiple_ima
 
     assert result == {"images": ["image-1", "image-2"]}
     assert calls == [(messages, 28, data_config)]
+
+
+def test_apply_offline_chat_template_builds_prompt_and_response_without_agent_loop():
+    messages = [{"role": "user", "content": "question"}]
+
+    class _Tokenizer:
+        def apply_chat_template(
+            self, received_messages, *, tokenize, add_generation_prompt, tools, return_dict, **kwargs
+        ):
+            assert tokenize is True
+            assert tools is None
+            assert return_dict is False
+            if add_generation_prompt:
+                return [10, 11, 12]
+            assert received_messages[-1]["role"] == "assistant"
+            return [10, 11, 12, 20, 21]
+
+    tokenizer = _Tokenizer()
+    prompt_ids = asyncio.run(
+        apply_offline_chat_template(
+            messages,
+            tokenizer=tokenizer,
+            processor=None,
+            add_generation_prompt=True,
+        )
+    )
+    full_ids = asyncio.run(
+        apply_offline_chat_template(
+            [*messages, {"role": "assistant", "content": "response"}],
+            tokenizer=tokenizer,
+            processor=None,
+            add_generation_prompt=False,
+        )
+    )
+
+    assert split_offline_response_tokens(prompt_ids, full_ids, max_response_length=4) == [20, 21]
 
 
 def _make_engine_stub():

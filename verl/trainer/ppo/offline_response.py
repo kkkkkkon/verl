@@ -12,7 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from typing import Any
+
+from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
+from verl.utils.tokenizer.chat_template import apply_chat_template as render_chat_template
+
+
+async def apply_offline_chat_template(
+    messages: list[dict],
+    *,
+    tokenizer: Any,
+    processor: Any,
+    add_generation_prompt: bool,
+    apply_chat_template_kwargs: dict[str, Any] | None = None,
+    images: Any = None,
+    videos: Any = None,
+    audios: Any = None,
+    mm_processor_kwargs: dict[str, Any] | None = None,
+) -> list[int]:
+    """Tokenize an offline prompt or prompt/response chat without an agent loop."""
+    chat_template_kwargs = apply_chat_template_kwargs or {}
+    if processor is not None:
+        raw_sequence = await asyncio.to_thread(
+            render_chat_template,
+            processor,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=False,
+            **chat_template_kwargs,
+        )
+        model_inputs = build_multimodal_processor_inputs(
+            processor,
+            text=[raw_sequence],
+            images=images,
+            videos=videos,
+            audio=audios,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        return normalize_token_ids(model_inputs.pop("input_ids"))
+
+    tokenized_sequence = await asyncio.to_thread(
+        render_chat_template,
+        tokenizer,
+        messages,
+        add_generation_prompt=add_generation_prompt,
+        tokenize=True,
+        **chat_template_kwargs,
+    )
+    return normalize_token_ids(tokenized_sequence)
 
 
 async def process_offline_multi_modal_info(
