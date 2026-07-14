@@ -32,7 +32,7 @@ from verl.experimental.agent_loop import (
     get_trajectory_info,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics
-from verl.trainer.ppo.offline_response import split_offline_response_tokens
+from verl.trainer.ppo.offline_response import process_offline_multi_modal_info, split_offline_response_tokens
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
@@ -105,7 +105,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             raise KeyError(f"Offline response distillation requires dataset field {self.response_key!r}.")
 
         messages = list(prompt["raw_prompt"])
-        multi_modal_data = await self.process_multi_modal_info(messages)
+        multi_modal_data = await process_offline_multi_modal_info(
+            messages,
+            processor=self.processor,
+            dataset_cls=self.dataset_cls,
+            data_config=self.config.data,
+        )
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")

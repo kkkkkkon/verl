@@ -12,6 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
+
+async def process_offline_multi_modal_info(
+    messages: list[dict], *, processor: Any, dataset_cls: type, data_config: Any
+) -> dict[str, Any]:
+    """Extract multimodal payloads using the dataset protocol used by agent loops."""
+    if processor is None:
+        return {}
+
+    image_patch_size = getattr(getattr(processor, "image_processor", None), "patch_size", 14)
+    if hasattr(dataset_cls, "process_multi_modal_info"):
+        images, videos, audios = await dataset_cls.process_multi_modal_info(
+            messages, image_patch_size=image_patch_size, config=data_config
+        )
+    else:
+        images, videos = await dataset_cls.process_vision_info(
+            messages, image_patch_size=image_patch_size, config=data_config
+        )
+        audios = None
+
+    multi_modal_data = {}
+    if images is not None:
+        multi_modal_data["images"] = images
+    if videos is not None:
+        multi_modal_data["videos"] = videos
+    if audios is not None:
+        multi_modal_data["audios"] = audios
+    return multi_modal_data
+
 
 def split_offline_response_tokens(
     prompt_ids: list[int], full_ids: list[int], max_response_length: int

@@ -30,6 +30,7 @@ test is the propagation of distillation keys, not the numerical correctness
 of log-prob computation.
 """
 
+import asyncio
 import os
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -47,7 +48,7 @@ from verl.trainer.distillation.topk_support import (
     build_prob_perception_support_from_logits,
     build_prob_perception_support_from_topk_logprobs,
 )
-from verl.trainer.ppo.offline_response import split_offline_response_tokens
+from verl.trainer.ppo.offline_response import process_offline_multi_modal_info, split_offline_response_tokens
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
@@ -64,6 +65,33 @@ def test_split_offline_response_tokens_uses_generation_prompt_boundary():
 
     with pytest.raises(ValueError, match="does not preserve the prompt generation prefix"):
         split_offline_response_tokens(prompt_ids, [10, 99, 12, 20], max_response_length=4)
+
+
+def test_process_offline_multi_modal_info_uses_dataset_protocol_for_multiple_images():
+    messages = [{"role": "user", "content": [{"type": "image"}, {"type": "image"}]}]
+    data_config = {"image_min_pixels": 100}
+    calls = []
+
+    class _Processor:
+        image_processor = SimpleNamespace(patch_size=28)
+
+    class _Dataset:
+        @classmethod
+        async def process_multi_modal_info(cls, received_messages, image_patch_size, config):
+            calls.append((received_messages, image_patch_size, config))
+            return ["image-1", "image-2"], None, None
+
+    result = asyncio.run(
+        process_offline_multi_modal_info(
+            messages,
+            processor=_Processor(),
+            dataset_cls=_Dataset,
+            data_config=data_config,
+        )
+    )
+
+    assert result == {"images": ["image-1", "image-2"]}
+    assert calls == [(messages, 28, data_config)]
 
 
 def _make_engine_stub():
