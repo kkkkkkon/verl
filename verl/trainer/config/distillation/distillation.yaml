@@ -17,6 +17,10 @@ enabled: false
 # server. This mode requires task rewards and policy gradient to be disabled.
 offline_response: false
 
+# Teacher execution backend. "rollout" uses vLLM/SGLang prompt logprobs;
+# "fsdp" batches fixed offline sequences through a forward-only FSDP model.
+teacher_backend: rollout
+
 # distillation loss config
 distillation_loss:
 

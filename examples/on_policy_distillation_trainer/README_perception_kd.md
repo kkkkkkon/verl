@@ -2,8 +2,10 @@
 
 This branch supports direct distillation from multimodal responses stored in
 the dataset. It does not sample a student rollout and does not create a student
-vLLM server. Student GPUs contain only the trainable FSDP actor; teacher GPUs
-still run the teacher vLLM server used to produce distillation targets.
+vLLM server. Student GPUs contain only the trainable FSDP actor. By default,
+teacher GPUs now contain a separate forward-only FSDP teacher, so logits,
+top-k selection, and perception support selection run on GPU without
+vLLM `prompt_logprobs` serialization.
 
 ## Dataset schema
 
@@ -21,7 +23,7 @@ student model's chat template. The response suffix receives the same
 `response_mask` used by online distillation, so only assistant response tokens
 contribute to the loss.
 
-## Run 4B teacher to 2B student
+## Run 8B teacher to 2B student
 
 ```bash
 TRAIN_FILES="['/path/to/train-00000-of-00006.parquet', '/path/to/train-00001-of-00006.parquet']" \
@@ -29,18 +31,19 @@ VAL_FILES="['/path/to/train-00000-of-00006.parquet']" \
 NGPUS_PER_NODE=2 \
 TEACHER_TP=2 \
 TEACHER_WORLD_SIZE=2 \
-bash examples/on_policy_distillation_trainer/run_qwen3vl_4b_to_2b_perception_kd_fsdp.sh
+bash examples/on_policy_distillation_trainer/run_qwen3vl_8b_to_2b_perception_kd_fsdp.sh
 ```
 
 `NGPUS_PER_NODE` is the number of student FSDP actor GPUs.
 `TEACHER_WORLD_SIZE` is the size of the separate teacher resource pool. The
 example above therefore requests four GPUs in total: two student actor GPUs and
-two teacher vLLM GPUs.
+two teacher FSDP GPUs.
 
 The launcher defaults to:
 
 ```text
 OFFLINE_RESPONSE=True
+TEACHER_BACKEND=fsdp
 USE_POLICY_GRADIENT=False
 USE_PERCEPTION_SCORE=True
 DISTILLATION_LOSS_MODE=mixed_kl
@@ -49,6 +52,13 @@ PERCEPTION_CANDIDATE_TOPK=128
 KL_MIX_ALPHA=0.5
 USE_STUDENT_LORA=False
 ```
+
+Perception KD performs two teacher forwards, one with the original image and
+one with a black image, so its teacher compute is expected to be roughly twice
+the non-perception path. The important difference from the vLLM path is that
+the teacher cards remain compute-active instead of waiting for a CPU process to
+materialize Python prompt-logprob objects. Set `TEACHER_BACKEND=rollout` only
+when the legacy vLLM/SGLang teacher path is required.
 
 Generated-response validation requires a student rollout server and is
 therefore disabled in this mode. Keep `trainer.val_before_train=False` and

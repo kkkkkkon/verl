@@ -20,6 +20,44 @@ TOPK_MODE_PROB_PERCEPTION = "prob_perception"
 VALID_TOPK_MODES = {TOPK_MODE_PROB, TOPK_MODE_PROB_PERCEPTION}
 
 
+def build_topk_logprobs_from_logits(
+    logits: torch.Tensor,
+    topk: int,
+    chunk_size: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select exact top-k log probabilities without materializing fp32 logits.
+
+    The teacher forward commonly produces bf16 logits with shape ``[B, T, V]``.
+    Converting the complete tensor to fp32 before ``log_softmax`` can require
+    several additional gigabytes, so the token dimension is streamed in chunks.
+    All selection and normalization stays on the input tensor's device.
+    """
+    if logits.ndim < 2:
+        raise ValueError(f"logits must have at least two dimensions, got {logits.shape}.")
+    if topk <= 0 or topk > logits.size(-1):
+        raise ValueError(f"topk must be in [1, {logits.size(-1)}], got {topk}.")
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+
+    leading_shape = logits.shape[:-1]
+    vocab_size = logits.size(-1)
+    flat_logits = logits.reshape(-1, vocab_size)
+    num_tokens = flat_logits.size(0)
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=logits.device)
+    topk_logprobs = torch.empty((num_tokens, topk), dtype=torch.float32, device=logits.device)
+
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        chunk_logits = flat_logits[start:end].float()
+        chunk_topk_logits, chunk_topk_ids = torch.topk(chunk_logits, k=topk, dim=-1, sorted=True)
+        chunk_log_normalizer = torch.logsumexp(chunk_logits, dim=-1, keepdim=True)
+        topk_ids[start:end] = chunk_topk_ids.to(torch.int32)
+        topk_logprobs[start:end] = chunk_topk_logits - chunk_log_normalizer
+
+    output_shape = (*leading_shape, topk)
+    return topk_ids.reshape(output_shape), topk_logprobs.reshape(output_shape)
+
+
 def validate_topk_mode(topk_mode: str) -> None:
     if topk_mode not in VALID_TOPK_MODES:
         raise ValueError(
@@ -84,9 +122,7 @@ def build_prob_perception_support_from_logits(
     candidate_topk = min(perception_candidate_topk, teacher_logits_img.size(-1))
     _validate_candidate_topk(candidate_topk, topk, teacher_logits_img.size(-1))
 
-    candidate_logits_img, candidate_ids = torch.topk(
-        teacher_logits_img, k=candidate_topk, dim=-1, sorted=True
-    )
+    candidate_logits_img, candidate_ids = torch.topk(teacher_logits_img, k=candidate_topk, dim=-1, sorted=True)
     prob_ids = candidate_ids[..., :prob_topk]
     candidate_logits_mask = torch.gather(teacher_logits_mask, dim=-1, index=candidate_ids)
     perception_score = candidate_logits_img - candidate_logits_mask
@@ -132,9 +168,7 @@ def build_prob_perception_support_from_topk_logprobs(
 
     prob_topk, perception_topk = split_prob_perception_topk(topk)
     candidate_topk = _validate_candidate_topk(perception_candidate_topk, topk, teacher_ids_img.size(-1))
-    candidate_logprobs, candidate_positions = torch.topk(
-        teacher_logprobs_img, k=candidate_topk, dim=-1, sorted=True
-    )
+    candidate_logprobs, candidate_positions = torch.topk(teacher_logprobs_img, k=candidate_topk, dim=-1, sorted=True)
     candidate_ids = torch.gather(teacher_ids_img, dim=-1, index=candidate_positions)
     prob_ids = candidate_ids[..., :prob_topk]
     prob_logprobs = candidate_logprobs[..., :prob_topk]

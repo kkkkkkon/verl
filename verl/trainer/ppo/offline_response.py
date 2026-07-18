@@ -63,6 +63,67 @@ async def apply_offline_chat_template(
     return normalize_token_ids(tokenized_sequence)
 
 
+async def tokenize_offline_response(
+    messages: list[dict],
+    response: Any,
+    *,
+    tokenizer: Any,
+    processor: Any,
+    apply_chat_template_kwargs: dict[str, Any] | None = None,
+) -> list[int]:
+    """Render and tokenize only the assistant continuation of an offline chat.
+
+    Tokenizing the prompt and the full prompt/response chat independently does
+    not guarantee that the prompt token IDs are a prefix of the full token IDs:
+    a tokenizer may merge text across the generation boundary.  Autoregressive
+    generation cannot change the already-tokenized prompt, so tokenize the
+    rendered assistant suffix independently instead.
+    """
+    chat_template_kwargs = apply_chat_template_kwargs or {}
+    template_source = processor if processor is not None else tokenizer
+    full_messages = [*messages, {"role": "assistant", "content": str(response)}]
+
+    prompt_text = render_chat_template(
+        template_source,
+        messages,
+        add_generation_prompt=True,
+        tokenize=False,
+        **chat_template_kwargs,
+    )
+    full_text = render_chat_template(
+        template_source,
+        full_messages,
+        add_generation_prompt=False,
+        tokenize=False,
+        **chat_template_kwargs,
+    )
+    if not isinstance(prompt_text, str) or not isinstance(full_text, str):
+        raise TypeError(
+            "Offline chat templates must render strings when tokenize=False, "
+            f"got {type(prompt_text).__name__} and {type(full_text).__name__}."
+        )
+    if not full_text.startswith(prompt_text):
+        mismatch = next(
+            (
+                i
+                for i, (prompt_char, full_char) in enumerate(zip(prompt_text, full_text, strict=False))
+                if prompt_char != full_char
+            ),
+            min(len(prompt_text), len(full_text)),
+        )
+        raise ValueError(
+            "The full chat template does not preserve the prompt generation prefix; "
+            f"first character mismatch at {mismatch}."
+        )
+
+    response_text = full_text[len(prompt_text) :]
+    tokenized_response = tokenizer(response_text, add_special_tokens=False)
+    response_ids = normalize_token_ids(tokenized_response)
+    if not response_ids:
+        raise ValueError("Dataset response produced no assistant tokens after applying the chat template.")
+    return response_ids
+
+
 async def process_offline_multi_modal_info(
     messages: list[dict], *, processor: Any, dataset_cls: type, data_config: Any
 ) -> dict[str, Any]:

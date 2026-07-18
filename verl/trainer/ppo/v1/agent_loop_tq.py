@@ -32,14 +32,15 @@ from verl.experimental.agent_loop import (
     get_trajectory_info,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics
+from verl.experimental.teacher_loop.teacher_manager import _mask_multi_modal_images
+from verl.trainer.distillation.topk_support import TOPK_MODE_PROB_PERCEPTION
 from verl.trainer.ppo.offline_response import (
     apply_offline_chat_template,
     process_offline_multi_modal_info,
-    split_offline_response_tokens,
+    tokenize_offline_response,
 )
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
-from verl.utils.tokenizer import build_multimodal_processor_inputs
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -58,6 +59,14 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         tq.init()
         self.background_tasks = set()
         self.offline_response = bool(self.config.distillation.get("offline_response", False))
+        self.offline_fsdp_teacher = (
+            self.offline_response and self.config.distillation.get("teacher_backend", "rollout") == "fsdp"
+        )
+        self.offline_fsdp_perception = (
+            self.offline_fsdp_teacher
+            and self.config.distillation.distillation_loss.get("topk_mode", "prob")
+            == TOPK_MODE_PROB_PERCEPTION
+        )
         self.response_key = self.config.data.get("response_key", "response")
 
     async def _build_offline_response_output(self, prompt: dict) -> AgentLoopOutput:
@@ -98,23 +107,14 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 )
             prompt_ids = prompt_ids[-self.rollout_config.prompt_length :]
 
-        full_messages = [*messages, {"role": "assistant", "content": str(response)}]
-        full_ids = await apply_offline_chat_template(
-            full_messages,
+        response_ids = await tokenize_offline_response(
+            messages,
+            response,
             tokenizer=self.tokenizer,
             processor=self.processor,
-            add_generation_prompt=False,
             apply_chat_template_kwargs=apply_chat_template_kwargs,
-            images=images,
-            videos=videos,
-            audios=audios,
-            mm_processor_kwargs=mm_processor_kwargs,
         )
-        response_ids = split_offline_response_tokens(
-            prompt_ids=prompt_ids,
-            full_ids=full_ids,
-            max_response_length=self.rollout_config.response_length,
-        )
+        response_ids = response_ids[: self.rollout_config.response_length]
         return AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
@@ -268,6 +268,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
             field["multi_modal_inputs"] = multi_modal_inputs
+            if self.offline_fsdp_perception:
+                masked_output = output.model_copy(
+                    update={"multi_modal_data": _mask_multi_modal_images(output.multi_modal_data or {})}
+                )
+                field["masked_multi_modal_inputs"] = self._compute_multi_modal_inputs(masked_output, input_ids)
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
             tags.append(

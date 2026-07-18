@@ -24,8 +24,10 @@ RUN_NAME=${RUN_NAME:-qwen3vl_8b_to_2b}
 DATA_DIR=${DATA_DIR:-$HOME/data/image_qa}
 TRAIN_FILE=${TRAIN_FILE:-}
 VAL_FILE=${VAL_FILE:-}
-TRAIN_FILES=${TRAIN_FILES:-"['dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00000-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00001-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00002-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00003-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00004-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00005-of-00006.parquet']"}
-VAL_FILES=${VAL_FILES:-"['/data/chutong/workspace/rl-reason/verl/dataset/hiyouga/data/validation-00000-of-00001.parquet']"}
+# TRAIN_FILES=${TRAIN_FILES:-"['dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00000-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00001-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00002-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00003-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00004-of-00006.parquet', 'dataset/PAPOGalaxy/PAPO_ViRL39K_train/data/train-00005-of-00006.parquet']"}
+TRAIN_FILES=${TRAIN_FILES:-"['dataset/offline/Qwen3-VL-2B-Thinking/PAPO_ViRL39K_train.parquet']"}
+VAL_FILES=${VAL_FILES:-"['dataset/hiyouga/data/validation-00000-of-00001.parquet']"}
+
 
 DATA_SOURCE=${DATA_SOURCE:-PAPOGalaxy/PAPO_ViRL39K_train}
 VAL_DATA_SOURCE=${VAL_DATA_SOURCE:-hiyouga/validation}
@@ -62,10 +64,11 @@ TEACHER_NNODES=${TEACHER_NNODES:-1}
 TEACHER_TP=${TEACHER_TP:-1}
 TEACHER_NUM_REPLICAS=${TEACHER_NUM_REPLICAS:-1}
 TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE:-$(( TEACHER_TP * TEACHER_NUM_REPLICAS ))}
+teacher_backend=${TEACHER_BACKEND:-rollout}
 
 # ---- paper-style hyperparameters ----
-train_batch_size=${TRAIN_BATCH_SIZE:-128}
-ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-128}
+train_batch_size=${TRAIN_BATCH_SIZE:-1}
+ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-1}
 val_max_samples=${VAL_MAX_SAMPLES:-512}
 rollout_n=${ROLLOUT_N:-1}
 if [[ "$rollout_n" != 1 ]]; then
@@ -156,7 +159,7 @@ rollout_tp=${ROLLOUT_TP:-1}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.8}
 teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.8}
 
-save_freq=${SAVE_FREQ:-100}
+save_freq=${SAVE_FREQ:-10}
 if [[ "$offline_response_enabled" == True ]]; then
     test_freq=${TEST_FREQ:--1}
 else
@@ -164,7 +167,7 @@ else
 fi
 val_before_train=${VAL_BEFORE_TRAIN:-False}
 logger=${LOGGER:-'["console","swanlab"]'}
-project_name=${PROJECT_NAME:-vanilla_opd}
+project_name=${PROJECT_NAME:-perception_kd}
 if [[ "$offline_response_enabled" == True && "$student_lora_enabled" == True ]]; then
     default_experiment_name=${RUN_NAME}_${distillation_loss_mode}_lora_r${student_lora_rank}_perception_kd
 elif [[ "$offline_response_enabled" == True ]]; then
@@ -266,10 +269,10 @@ ACTOR=(
     actor_rollout_ref.actor.optim.lr_scheduler_type=constant
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=${lr_warmup_steps_ratio}
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
-    actor_rollout_ref.actor.use_dynamic_bsz=True
+    actor_rollout_ref.actor.use_dynamic_bsz=False
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
-    actor_rollout_ref.actor.fsdp_config.param_offload=True
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+    actor_rollout_ref.actor.fsdp_config.param_offload=False
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
 )
 
 ROLLOUT=(
@@ -312,7 +315,6 @@ TRAINER=(
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}
-    # trainer.total_training_steps=${total_training_steps}
 )
 
 REWARD=(
@@ -323,6 +325,7 @@ REWARD=(
 DISTILL=(
     distillation.enabled=True
     distillation.offline_response=${offline_response_enabled}
+    distillation.teacher_backend=${teacher_backend}
     distillation.n_gpus_per_node=${TEACHER_WORLD_SIZE}
     distillation.nnodes=${TEACHER_NNODES}
     distillation.teacher_models.teacher_model.model_path="$TEACHER_MODEL"

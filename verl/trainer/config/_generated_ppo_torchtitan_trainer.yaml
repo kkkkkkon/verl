@@ -769,11 +769,16 @@ algorithm:
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false
+  offline_response: false
+  teacher_backend: rollout
   distillation_loss:
     _target_: verl.workers.config.DistillationLossConfig
     loss_mode: k3
     topk: 32
     topk_mode: prob
+    perception_candidate_topk: 128
+    use_tail_bucket: null
+    kl_mix_alpha: 0.5
     use_task_rewards: true
     distillation_loss_coef: 1.0
     loss_max_clamp: null

@@ -224,21 +224,29 @@ class DistillationTeacherModelConfig(BaseConfig):
         if self.num_replicas is None:
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
-    def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
+    def validate_and_prepare_for_distillation(
+        self,
+        use_topk: bool,
+        topk: Optional[int],
+        teacher_backend: str = "rollout",
+    ) -> None:
         # Prompt + Response from student are fed into teacher as context
         max_model_len = self.inference.max_model_len
         student_prompt_length = self.inference.prompt_length
         student_response_length = self.inference.response_length
-        required_context_len = student_prompt_length + student_response_length + 1
+        generation_headroom = 0 if teacher_backend == "fsdp" else 1
+        required_context_len = student_prompt_length + student_response_length + generation_headroom
         if max_model_len is not None and required_context_len > max_model_len:
             raise ValueError(
-                "Distillation teacher inference requires room for the student prompt, the full student "
-                f"response, and one generated token, but got {student_prompt_length=}, "
+                "Distillation teacher inference requires room for the student prompt and full student "
+                f"response{', plus one generated token' if generation_headroom else ''}, but got "
+                f"{student_prompt_length=}, "
                 f"{student_response_length=}, {required_context_len=}, {max_model_len=}."
             )
         self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
-        self.inference.response_length = 1
-        self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
+        self.inference.response_length = generation_headroom
+        if teacher_backend == "rollout":
+            self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
 
     def _validate_topk_logprobs(self, use_topk: bool, topk: Optional[int]) -> None:
         if not use_topk:
@@ -282,6 +290,9 @@ class DistillationConfig(BaseConfig):
     offline_response (bool):
         Whether to train from responses stored in the dataset instead of
         sampling trajectories from the student rollout server.
+    teacher_backend (str):
+        ``rollout`` launches teacher inference servers. ``fsdp`` runs one
+        forward-only teacher across the offline teacher resource pool.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -319,6 +330,7 @@ class DistillationConfig(BaseConfig):
 
     enabled: bool = False
     offline_response: bool = False
+    teacher_backend: str = "rollout"
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
@@ -336,13 +348,34 @@ class DistillationConfig(BaseConfig):
                 "distillation.offline_response=True requires "
                 "distillation_loss.use_task_rewards=False and use_policy_gradient=False."
             )
+        if self.teacher_backend not in {"rollout", "fsdp"}:
+            raise ValueError(
+                f"Unsupported distillation teacher_backend {self.teacher_backend!r}; expected 'rollout' or 'fsdp'."
+            )
+        if self.teacher_backend == "fsdp":
+            if not self.offline_response:
+                raise ValueError("distillation.teacher_backend='fsdp' currently requires offline_response=True.")
+            if not self.distillation_loss.loss_settings.use_topk:
+                raise ValueError("distillation.teacher_backend='fsdp' currently supports top-k losses only.")
 
         self.teacher_models = self._resolve_teacher_models()
+        if self.teacher_backend == "fsdp" and len(self.teacher_models) != 1:
+            raise ValueError("distillation.teacher_backend='fsdp' currently supports exactly one teacher model.")
+        if self.teacher_backend == "fsdp":
+            teacher_model = next(iter(self.teacher_models.values()))
+            if teacher_model.num_replicas != 1:
+                raise ValueError(
+                    "distillation.teacher_backend='fsdp' launches one FSDP teacher across the entire teacher "
+                    "resource pool. Configure the teacher inference parallel world size to equal "
+                    "distillation.n_gpus_per_node * distillation.nnodes (for the example launcher, set "
+                    "TEACHER_TP=TEACHER_WORLD_SIZE)."
+                )
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.teacher_logprob_topk,
+                teacher_backend=self.teacher_backend,
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

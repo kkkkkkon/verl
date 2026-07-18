@@ -52,7 +52,9 @@ from verl.trainer.ppo.offline_response import (
     apply_offline_chat_template,
     process_offline_multi_modal_info,
     split_offline_response_tokens,
+    tokenize_offline_response,
 )
+from verl.trainer.ppo.padding_utils import construct_minimal_padding_template
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
@@ -132,6 +134,84 @@ def test_apply_offline_chat_template_builds_prompt_and_response_without_agent_lo
     )
 
     assert split_offline_response_tokens(prompt_ids, full_ids, max_response_length=4) == [20, 21]
+
+
+def test_tokenize_offline_response_tokenizes_rendered_assistant_suffix_independently():
+    class _Processor:
+        def apply_chat_template(
+            self, received_messages, *, tokenize, add_generation_prompt, tools, return_dict, **kwargs
+        ):
+            assert tokenize is False
+            assert tools is None
+            assert return_dict is False
+            if add_generation_prompt:
+                return "prompt<assistant>"
+            assert received_messages[-1] == {"role": "assistant", "content": "response"}
+            return "prompt<assistant>response<end>"
+
+    class _Tokenizer:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, text, *, add_special_tokens):
+            self.calls.append((text, add_special_tokens))
+            return {"input_ids": [20, 21]}
+
+    tokenizer = _Tokenizer()
+    response_ids = asyncio.run(
+        tokenize_offline_response(
+            [{"role": "user", "content": "question"}],
+            "response",
+            tokenizer=tokenizer,
+            processor=_Processor(),
+        )
+    )
+
+    assert response_ids == [20, 21]
+    assert tokenizer.calls == [("response<end>", False)]
+
+
+def test_distillation_padding_teacher_outputs_match_minimal_sequence():
+    support_size = 4
+    source_td = {
+        "position_ids": torch.arange(6),
+        "teacher_ids": torch.randint(0, _VOCAB_SIZE, (6, support_size), dtype=torch.int32),
+        "teacher_logprobs": torch.randn(6, support_size),
+    }
+    template, tag = construct_minimal_padding_template(
+        source_td,
+        {"prompt_len": 3, "response_len": 3, "seq_len": 6},
+        eos_token_id=1,
+    )
+
+    assert template["input_ids"].shape == (2,)
+    assert template["teacher_ids"].shape == (2, support_size)
+    assert template["teacher_logprobs"].shape == (2, support_size)
+    assert tag["is_padding"] is True
+
+    teacher_ids = torch.nested.as_nested_tensor([template["teacher_ids"]], layout=torch.jagged)
+    teacher_logprobs = torch.nested.as_nested_tensor([template["teacher_logprobs"]], layout=torch.jagged)
+    student_logits = torch.randn(1, 2, _VOCAB_SIZE)
+    config = SimpleNamespace(
+        distillation_loss=SimpleNamespace(
+            use_chunked_topk=False,
+            loss_mode="mixed_kl",
+            use_tail_bucket=None,
+            topk_mode="prob",
+            log_prob_min_clamp=-10.0,
+            kl_mix_alpha=0.5,
+        )
+    )
+
+    outputs = compute_fsdp_forward_kl_topk(
+        student_logits=student_logits,
+        teacher_topk_log_probs=teacher_logprobs,
+        teacher_topk_ids=teacher_ids,
+        config=config,
+        data_format="thd",
+    )
+    assert all(output.shape == (1, 2) for output in outputs.values())
+    assert all(torch.isfinite(output).all() for output in outputs.values())
 
 
 def _make_engine_stub():

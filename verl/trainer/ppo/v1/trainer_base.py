@@ -38,6 +38,10 @@ from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.reward_loop import RewardLoopManager
 from verl.experimental.teacher_loop import MultiTeacherModelManager
+from verl.experimental.teacher_loop.fsdp_teacher import (
+    OfflineFSDPTeacherWorker,
+    build_offline_fsdp_teacher_worker_config,
+)
 from verl.protocol import DataProto, DataProtoFuture
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
@@ -111,6 +115,8 @@ class PPOTrainer(ABC):
     def __init__(self, config: DictConfig):
         self.config = config
         self.offline_response = bool(config.get("distillation", {}).get("offline_response", False))
+        self.teacher_backend = config.get("distillation", {}).get("teacher_backend", "rollout")
+        self.use_offline_fsdp_teacher = self.offline_response and self.teacher_backend == "fsdp"
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
@@ -204,7 +210,24 @@ class PPOTrainer(ABC):
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=worker_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
-        # 3. create worker group for actor rollout and critic
+        # 3. define the forward-only offline FSDP teacher
+        self.distillation_config: DistillationConfig | None = (
+            omega_conf_to_dataclass(self.config.distillation) if self.use_teacher_policy else None
+        )
+        if self.use_offline_fsdp_teacher:
+            teacher_worker_config = build_offline_fsdp_teacher_worker_config(
+                config=self.config,
+                distillation_config=self.distillation_config,
+            )
+            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            teacher_cls = RayClassWithInitArgs(
+                cls=ray.remote(OfflineFSDPTeacherWorker),
+                config=teacher_worker_config,
+                distillation_config=self.distillation_config,
+            )
+            self.resource_pool_to_cls[teacher_resource_pool][str(Role.TeacherModel)] = teacher_cls
+
+        # 4. create worker groups
         all_wg = {}
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.global_profiler, "steps") is not None:
@@ -247,6 +270,13 @@ class PPOTrainer(ABC):
         self.actor_rollout_wg.init_model()
         logger.info("actor and ref model engine initialized")
 
+        if self.use_offline_fsdp_teacher:
+            self.teacher_model_wg = all_wg[str(Role.TeacherModel)]
+            self.teacher_model_wg.reset()
+            logger.info("offline FSDP teacher model engine initialized")
+        else:
+            self.teacher_model_wg = None
+
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = self.config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -270,16 +300,14 @@ class PPOTrainer(ABC):
         logger.info("reward loop manager initialized")
 
         # 8. initialize teacher loop manager
-        if self.use_teacher_policy:
+        if self.use_teacher_policy and not self.use_offline_fsdp_teacher:
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
         else:
             self.teacher_model_manager = None
-            self.distillation_config = None
 
         self.llm_server_manager = None
         self.checkpoint_manager = None
@@ -321,7 +349,7 @@ class PPOTrainer(ABC):
         Returns:
             dict[str, LLMServerClient]: The teacher server clients.
         """
-        return self.teacher_model_manager.get_client() if self.use_teacher_policy else None
+        return self.teacher_model_manager.get_client() if self.teacher_model_manager is not None else None
 
     def get_reward_handles(self) -> list[ray.actor.ActorHandle]:
         """Get the handles of reward loop workers."""
@@ -503,6 +531,11 @@ class PPOTrainer(ABC):
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
         batch = self._balance_batch(batch, metrics=metrics)
+        if self.use_offline_fsdp_teacher:
+            with marked_timer("teacher", timing_raw, color="olive"):
+                teacher_batch_size = len(batch)
+                batch = self.teacher_model_wg.compute_teacher_support(batch)
+                assert len(batch) == teacher_batch_size
         if self.config.trainer.critic_warmup <= self.global_steps:
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
@@ -1625,7 +1658,7 @@ class PPOTrainer(ABC):
         )
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["response_mask"].offsets().diff()
-        num_turns = np.asarray(data["num_turns"].tolist(), dtype=float)
+        num_turns = np.asarray(list(data["num_turns"]), dtype=float)
         if non_padding_mask.any():
             prompt_length = prompt_length[non_padding_mask]
             response_length = response_length[non_padding_mask]

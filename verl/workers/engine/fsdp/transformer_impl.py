@@ -405,7 +405,7 @@ class FSDPEngine(BaseEngine):
             # We force reference policy to use CPUOffload to save memory.
             # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
             cpu_offload = None
-            if self.engine_config.forward_only:
+            if self.engine_config.forward_only and self.engine_config.forward_only_param_offload:
                 cpu_offload = CPUOffload(offload_params=True)
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
@@ -432,7 +432,9 @@ class FSDPEngine(BaseEngine):
                 param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
             )
             offload_policy = None
-            if self.engine_config.offload_policy or self.engine_config.forward_only:
+            if self.engine_config.offload_policy or (
+                self.engine_config.forward_only and self.engine_config.forward_only_param_offload
+            ):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
                 offload_policy = CPUOffloadPolicy(pin_memory=True)
@@ -747,7 +749,8 @@ class FSDPEngine(BaseEngine):
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
 
         if self.engine_config.forward_only:
-            # force cpu_offload
+            # Forward-only FSDP placement is owned by its configured offload
+            # policy; manual actor-style model/optimizer moves do not apply.
             return
 
         device_name = get_device_name()
@@ -1163,7 +1166,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
                         v = v.squeeze(0)
-                        assert v.shape == (logits_rmpad.shape[0],), (
+                        assert v.shape[0] == logits_rmpad.shape[0], (
                             f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
                         )
                         if self.use_ulysses_sp:
@@ -1274,7 +1277,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
                         for k, v in outputs.items():
                             v = v.squeeze(0)
-                            assert v.shape == (logits_rmpad.shape[0],), (
+                            assert v.shape[0] == logits_rmpad.shape[0], (
                                 f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
                             )
                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)

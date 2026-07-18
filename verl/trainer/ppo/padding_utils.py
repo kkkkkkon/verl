@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import uuid
 from typing import Any
 
@@ -67,6 +68,51 @@ def build_padding_routed_experts(source_routed_experts: Any, seq_len: int) -> to
     )
 
 
+def build_padding_teacher_outputs(
+    source_teacher_ids: Any,
+    source_teacher_logprobs: Any,
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Build finite teacher targets aligned with a synthetic padding sequence."""
+    if not isinstance(source_teacher_ids, torch.Tensor) or not isinstance(source_teacher_logprobs, torch.Tensor):
+        return None
+    if source_teacher_ids.shape != source_teacher_logprobs.shape:
+        raise ValueError(
+            "teacher_ids and teacher_logprobs must have identical shapes, "
+            f"got {source_teacher_ids.shape} and {source_teacher_logprobs.shape}."
+        )
+    if source_teacher_ids.dim() == 0 or source_teacher_ids.shape[-1] == 0:
+        raise ValueError(f"Teacher outputs must have a non-empty support dimension, got {source_teacher_ids.shape}.")
+
+    target_shape = (seq_len, *source_teacher_ids.shape[1:])
+    teacher_ids = torch.zeros(
+        target_shape,
+        dtype=source_teacher_ids.dtype,
+        device=source_teacher_ids.device,
+    )
+    teacher_logprobs = torch.zeros(
+        target_shape,
+        dtype=source_teacher_logprobs.dtype,
+        device=source_teacher_logprobs.device,
+    )
+
+    # Top-k teacher outputs use [sequence, support].  A uniform distribution
+    # over distinct valid token IDs keeps all intermediate KL diagnostics
+    # finite even though the padding loss mask is zero.
+    if source_teacher_ids.dim() >= 2:
+        support_size = source_teacher_ids.shape[-1]
+        support_ids = torch.arange(
+            support_size,
+            dtype=source_teacher_ids.dtype,
+            device=source_teacher_ids.device,
+        )
+        support_view = (1,) * (source_teacher_ids.dim() - 1) + (support_size,)
+        teacher_ids.copy_(support_ids.reshape(support_view).expand(target_shape))
+        teacher_logprobs.fill_(-math.log(support_size))
+
+    return teacher_ids, teacher_logprobs
+
+
 def construct_minimal_padding_template(
     source_td: dict,
     source_tag: dict,
@@ -98,6 +144,11 @@ def construct_minimal_padding_template(
     response_mask = torch.zeros_like(prompts)
     position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
     routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
+    teacher_outputs = build_padding_teacher_outputs(
+        template_sample.get("teacher_ids"),
+        template_sample.get("teacher_logprobs"),
+        input_ids.size(0),
+    )
 
     # Update the fields and remove redundant parts
     template_sample.update(
@@ -114,10 +165,14 @@ def construct_minimal_padding_template(
     )
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
+    if "masked_multi_modal_inputs" in template_sample:
+        template_sample["masked_multi_modal_inputs"] = {}
     if routed_experts is not None:
         template_sample["routed_experts"] = routed_experts
     else:
         template_sample.pop("routed_experts", None)
+    if teacher_outputs is not None:
+        template_sample["teacher_ids"], template_sample["teacher_logprobs"] = teacher_outputs
 
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
     template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)

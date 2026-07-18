@@ -84,6 +84,7 @@ class EngineConfig(BaseConfig):
         "use_fused_kernels",
         "use_remove_padding",
         "forward_only",
+        "forward_only_param_offload",
         "param_offload",
     }
     # whether to offload param
@@ -94,6 +95,8 @@ class EngineConfig(BaseConfig):
     grad_offload: bool = False
     # whether the engine is forward only (e.g., ref policy)
     forward_only: bool = False
+    # whether a forward-only FSDP engine should force parameter CPU offload
+    forward_only_param_offload: bool = True
     # the strategy (backend)
     strategy: str = None
     # model dtype
